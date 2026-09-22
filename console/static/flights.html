@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flights &amp; Gates — Crew Ops Agent-a-thon</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="app.js"></script>
+<script>
+async function load() {
+  await renderShell("flights");
+  const content = document.getElementById("content");
+  content.innerHTML = `
+    <h1>Flights &amp; Gates</h1>
+    <div class="subtitle">First 60 flights of the operating week, chronologically — the full week is in <code>data/flights.json</code>.</div>
+    <div class="card"><table>
+      <thead><tr><th>Flight</th><th>Date</th><th>Route</th><th>Dep (UTC)</th><th>Aircraft</th><th>Gate</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  `;
+  try {
+    const flights = await api("/api/flights");
+    document.getElementById("rows").innerHTML = flights
+      .map(
+        (f) => `<tr>
+          <td>${f.flight_no}</td>
+          <td>${f.date}</td>
+          <td>${f.dep_station} &rarr; ${f.arr_station}</td>
+          <td>${f.dep_utc.slice(11, 16)}Z</td>
+          <td>${f.aircraft}</td>
+          <td>${f.boarding_gate_number || "-"}</td>
+        </tr>`
+      )
+      .join("");
+  } catch (e) {
+    document.getElementById("rows").innerHTML = `<tr><td colspan="6"><div class="error-banner">${escapeHtml(e.message)}</div></td></tr>`;
+  }
+}
+load();
+</script>
+</body>
+</html>

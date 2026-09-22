@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Disruption Workspace — Crew Ops Agent-a-thon</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="app.js"></script>
+<script>
+let scope = "mine";
+
+async function load() {
+  await renderShell("disruptions");
+  const content = document.getElementById("content");
+  content.innerHTML = `
+    <h1>Disruption Workspace</h1>
+    <div class="subtitle">Every open case drawn from the vendored scenario set — nothing fabricated.</div>
+    <div class="tabs">
+      <button data-scope="mine" class="active">My desk</button>
+      <button data-scope="other">Other desks</button>
+      <button data-scope="network">Whole network</button>
+    </div>
+    <div id="rows" class="card"></div>
+  `;
+
+  content.querySelectorAll(".tabs button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      content.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      scope = btn.dataset.scope;
+      renderRows();
+    });
+  });
+
+  renderRows();
+}
+
+async function renderRows() {
+  const rowsEl = document.getElementById("rows");
+  rowsEl.innerHTML = `<div class="empty">Loading...</div>`;
+  try {
+    const rows = await api(`/api/disruptions?scope=${scope}`);
+    rowsEl.innerHTML = rows.length
+      ? rows.map(rowHtml).join("")
+      : `<div class="empty">Nothing here.</div>`;
+  } catch (e) {
+    rowsEl.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function rowHtml(d) {
+  return `
+    <a class="list-row" href="${withController('/disruption.html?id=' + d.id)}">
+      <div>
+        <div class="title">#${d.id} — ${escapeHtml(d.title)}</div>
+        <div class="meta">${escapeHtml(d.narrative || "").slice(0, 110)}${(d.narrative || "").length > 110 ? "…" : ""}</div>
+        <div class="meta" style="margin-top:6px;"><span class="badge desk">${escapeHtml(d.desk)}</span></div>
+      </div>
+      <span class="badge ${d.status}">${d.status}</span>
+    </a>`;
+}
+
+load();
+</script>
+</body>
+</html>

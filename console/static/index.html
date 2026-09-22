@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Command Center — Crew Ops Agent-a-thon</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="app.js"></script>
+<script>
+async function load() {
+  await renderShell("command-center");
+  const content = document.getElementById("content");
+  content.innerHTML = `<div class="empty">Loading...</div>`;
+
+  try {
+    const cc = await api("/api/command-center");
+    content.innerHTML = `
+      <h1>Good shift, ${escapeHtml(cc.controller)}.</h1>
+      <div class="subtitle">
+        ${cc.open_disruptions} open disruption${cc.open_disruptions === 1 ? "" : "s"} network-wide,
+        ${cc.seats_at_risk.toLocaleString("en-IN")} seats exposed on affected flights.
+        ${cc.ledger_enabled ? "" : '<strong style="color:var(--danger)">Ledger offline — LEDGER_DATABASE_URL not set, contention/commit disabled.</strong>'}
+      </div>
+      <div class="grid grid-4" style="margin-bottom:24px;">
+        <div class="card">
+          <div class="metric-label">Open disruptions</div>
+          <div class="metric-value">${cc.open_disruptions}</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Your desk</div>
+          <div class="metric-value">${cc.my_open_disruptions}</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Seats at risk</div>
+          <div class="metric-value danger">${cc.seats_at_risk.toLocaleString("en-IN")}</div>
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Aircraft capacity on affected flights — the dataset has no booking/load-factor data.</div>
+        </div>
+        <div class="card">
+          <div class="metric-label">Ledger</div>
+          <div class="metric-value" style="font-size:16px; color:${cc.ledger_enabled ? 'var(--accent)' : 'var(--danger)'}">
+            ${cc.ledger_enabled ? "Connected" : "Offline"}
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Open on your desk</h2>
+        <div id="mine"></div>
+      </div>
+    `;
+
+    const mine = await api("/api/disruptions?scope=mine");
+    const open = mine.filter((d) => d.status === "open");
+    document.getElementById("mine").innerHTML = open.length
+      ? open.map(rowHtml).join("")
+      : `<div class="empty">Nothing open on your desk right now.</div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function rowHtml(d) {
+  return `
+    <a class="list-row" href="${withController('/disruption.html?id=' + d.id)}">
+      <div>
+        <div class="title">${escapeHtml(d.title)}</div>
+        <div class="meta">${escapeHtml(d.event_type)} · ${escapeHtml(d.desk)}</div>
+      </div>
+      <span class="badge ${d.status}">${d.status}</span>
+    </a>`;
+}
+
+load();
+</script>
+</body>
+</html>

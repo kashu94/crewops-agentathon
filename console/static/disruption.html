@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Disruption — Crew Ops Agent-a-thon</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="app.js"></script>
+<script>
+const id = new URLSearchParams(window.location.search).get("id");
+let selected = null;
+let detail = null;
+
+async function load() {
+  await renderShell("disruptions");
+  await refresh();
+}
+
+async function refresh() {
+  const content = document.getElementById("content");
+  content.innerHTML = `<div class="empty">Loading...</div>`;
+  try {
+    detail = await api(`/api/disruptions/${id}`);
+  } catch (e) {
+    content.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  render();
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return "-";
+  return new Date(iso.endsWith("Z") ? iso : iso + "Z").toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  return new Date(iso.endsWith("Z") ? iso : iso + "Z").toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + " UTC";
+}
+
+// -- "What needs covering": stats row, the requirement card, and the
+// Flights/Duty periods/Crew/Gates/Reserve capacity accordions -- all read
+// straight off `d.requirement`, which server.py builds from the same
+// vendored dataset `find_options` already reasons over. No figure here is
+// invented for display; a number the dataset genuinely doesn't have (a real
+// passenger/booking count) is simply left out.
+function renderRequirement(d) {
+  const r = d.requirement;
+  if (!r) return "";
+
+  const flightsBody = r.flights
+    .map(
+      (f) => `<div class="accordion-row">
+        <div>${escapeHtml(f.flight_no)} <span class="meta">${escapeHtml(f.dep_station)} &rarr; ${escapeHtml(f.arr_station)} &middot; ${escapeHtml(f.date)}, ${fmtTime(f.dep_utc)}</span></div>
+        <div>${f.uncrewed ? '<span class="badge open">Uncrewed</span>' : `<span class="meta">${f.seats} seats</span>`}</div>
+      </div>`
+    )
+    .join("");
+
+  const dutyBody = r.duty_periods
+    .map(
+      (p) => `<div class="accordion-row">
+        <div>${escapeHtml(p.pairing_id)} <span class="meta">${escapeHtml(p.date)} &middot; ${p.n_sectors} sector(s)</span></div>
+        <div>${p.scheduled_hours}h scheduled</div>
+      </div>`
+    )
+    .join("");
+
+  const crewBody = r.crew_roster
+    .map(
+      (c) => `<div class="accordion-row">
+        <div>${escapeHtml(c.name || c.crew_id)} <span class="meta">${escapeHtml(c.role)} &middot; ${escapeHtml(c.base)}</span></div>
+        <div><span class="badge ${c.status === 'unavailable' ? 'open' : ''}">${escapeHtml(c.status)}</span></div>
+      </div>`
+    )
+    .join("");
+
+  const gatesBody = r.gates.length
+    ? r.gates
+        .map(
+          (g) => `<div class="accordion-row">
+            <div>${escapeHtml(g.flight_id)} <span class="meta">gate ${escapeHtml(g.gate)}</span></div>
+            <div class="meta">${fmtTime(g.boarding_start_utc)} &ndash; ${fmtTime(g.boarding_end_utc)}</div>
+          </div>`
+        )
+        .join("")
+    : `<div class="empty">No boarding-gate assignment recorded for this pairing.</div>`;
+
+  const reserveBody = r.reserve_capacity
+    .map(
+      (rc) => `<div class="accordion-row">
+        <div>${escapeHtml(rc.base)}</div>
+        <div>${rc.count} on call (${escapeHtml(r.role)}, ${escapeHtml(r.duty_dates[0])})</div>
+      </div>`
+    )
+    .join("");
+
+  return `
+    <div class="grid grid-4 stats-row" style="margin-bottom:18px;">
+      <div class="card"><div class="metric-label">Seats at risk</div><div class="metric-value danger">${r.seats_at_risk}</div></div>
+      <div class="card"><div class="metric-label">Flights affected</div><div class="metric-value">${r.flights_affected}</div></div>
+      <div class="card"><div class="metric-label">Stations affected</div><div class="metric-value">${r.stations_affected}</div></div>
+      <div class="card"><div class="metric-label">Duty dates</div><div class="metric-value" style="font-size:16px;">${r.duty_dates.join(", ")}</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:18px;">
+      <h2>What needs covering</h2>
+      <div class="kv-grid">
+        <div class="kv-item"><div class="kv-label">Role</div><div class="kv-value">${escapeHtml(r.role)}</div></div>
+        <div class="kv-item"><div class="kv-label">Aircraft type</div><div class="kv-value">${escapeHtml(r.aircraft_type || "-")}</div></div>
+        <div class="kv-item"><div class="kv-label">Base</div><div class="kv-value">${escapeHtml(r.base)}</div></div>
+        <div class="kv-item"><div class="kv-label">Unavailable crew</div><div class="kv-value">${escapeHtml(r.unavailable_crew_name || r.unavailable_crew_id)} (${escapeHtml(r.unavailable_crew_id)})</div></div>
+        <div class="kv-item span-2"><div class="kv-label">Uncovered flights</div><div class="kv-value">${r.flights.filter(f=>f.uncrewed).map(f=>`${escapeHtml(f.flight_no)}-${escapeHtml(f.date)}`).join(", ") || "-"}</div></div>
+      </div>
+    </div>
+
+    <details class="accordion" open>
+      <summary>Flights <span class="count">${r.flights.length}</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body">${flightsBody}</div>
+    </details>
+    <details class="accordion">
+      <summary>Duty periods <span class="count">${r.duty_periods.length}</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body">${dutyBody}</div>
+    </details>
+    <details class="accordion" open>
+      <summary>Crew <span class="count">${r.crew_roster.length}</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body">${crewBody}</div>
+    </details>
+    <details class="accordion">
+      <summary>Gates <span class="count">${r.gates.length}</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body">${gatesBody}</div>
+    </details>
+    <details class="accordion" style="margin-bottom:20px;">
+      <summary>Reserve capacity <span class="count">${r.reserve_capacity.length}</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body">${reserveBody}</div>
+    </details>
+  `;
+}
+
+// The rich, per-option contention view -- every contended option gets its
+// own line naming which desk's disruption also wants that crew member, on
+// which pairing, at what rank there. "Your own desk" only when the OTHER
+// disruption's opener is this tab's own controller; the ledger's
+// `opened_by` on `open_disruptions` is what makes that distinction real
+// rather than a guess.
+function renderContention(d) {
+  if (!d.contention_summary) return "";
+  const me = getController();
+  const contended = (d.options || []).filter((o) => o.contended_by && o.contended_by.length);
+
+  let html = `<div class="contention-box">
+    <div class="headline">&#9888; Competing for the same crew</div>
+    <div>${escapeHtml(d.contention_summary)}</div>`;
+
+  html += contended
+    .map((o) => {
+      const also = o.contended_by
+        .map((c) => {
+          const whose = c.opened_by === me ? "your own desk" : c.opened_by ? `${escapeHtml(c.opened_by)}'s desk` : "another desk";
+          return `${whose} on ${escapeHtml(c.pairing_id)} (${escapeHtml(c.disruption_id)}, their rank ${c.rank})`;
+        })
+        .join(", ");
+      return `<div class="contended-option">
+        <div class="who"><span>${escapeHtml(o.crew_id)} &middot; rank ${o.rank} here</span><span>${inr(o.cost_inr)}</span></div>
+        <div class="also">Also wanted by ${also}.</div>
+      </div>`;
+    })
+    .join("");
+
+  if (contended.length) {
+    html += `<div style="margin-top:10px; color:var(--muted);">Advisory only — nothing is reserved. Committing here re-checks legality against the live roster at that moment, so a genuine double-booking is always caught even if this warning is stale.</div>`;
+  }
+  html += `</div>`;
+
+  const otherIds = [...new Set(contended.flatMap((o) => o.contended_by.map((c) => c.disruption_id)))]
+    .filter((oid) => oid !== d.disruption_id);
+  if (otherIds.length && d.status !== "resolved") {
+    html += `<div class="card" style="margin-bottom:20px;">
+      <strong>Resolve these together</strong>
+      <div style="color:var(--muted); font-size:13px; margin: 6px 0 12px;">
+        These requirements compete for the same crew. A joint plan searches every legal
+        combination and returns the cheapest disjoint assignment, instead of leaving it to
+        whichever desk approves first.
+      </div>
+      <button class="primary" id="joint-plan-btn" data-with="${otherIds.join(",")}">Build a joint plan</button>
+      <div id="joint-plan-result" style="margin-top:16px;"></div>
+    </div>`;
+  }
+  return html;
+}
+
+// The Balanced card's own reasoning, in the reference UI's shape: a
+// one-line "why" (already computed by port.py, not invented for display),
+// the cost premium over the cheapest legal option, and the runner-up. No
+// policy-document quotation is shown here -- this build has no such
+// document to cite, and inventing one would be exactly the kind of
+// unsourced claim `verifier.py` exists to catch everywhere else.
+function renderPolicyExplain(d) {
+  const balanced = d.policies && d.policies.balanced;
+  const cmp = d.balanced_comparison;
+  if (!balanced || !cmp) return "";
+
+  const bullets = [];
+  if (cmp.cheapest_crew_id && cmp.cheapest_crew_id !== balanced.crew_id) {
+    bullets.push(
+      `${inr(cmp.premium_over_cheapest_inr)} more than the cheapest legal option (${escapeHtml(cmp.cheapest_crew_id)}, ${inr(cmp.cheapest_cost_inr)}).`
+    );
+    bullets.push(
+      cmp.uses_reserve
+        ? "This option calls out a reserve crew member; the cheapest option leaves more reserve buffer untouched."
+        : "The premium buys reserve cover: this option leaves the reserve pool untouched where the cheapest one would draw from it."
+    );
+  }
+  if (cmp.runner_up) {
+    bullets.push(
+      `Runner-up: ${escapeHtml(cmp.runner_up.action)} at ${inr(cmp.runner_up.cost_inr)}, delay ${cmp.runner_up.delay_hours || 0}h, resilience ${cmp.runner_up.resilience}.`
+    );
+  }
+
+  return `<div class="policy-explain">
+    <div class="why">${escapeHtml(balanced.why)}</div>
+    ${bullets.length ? `<ul>${bullets.map((b) => `<li>${b}</li>`).join("")}</ul>` : ""}
+    <div class="compare-stats">
+      <div><div class="kv-label">Total cost</div><div class="kv-value">${inr(balanced.cost_inr)}</div></div>
+      <div><div class="kv-label">Delay</div><div class="kv-value">${balanced.delay_hours || 0}h</div></div>
+      <div><div class="kv-label">Resilience</div><div class="kv-value">${balanced.resilience}/100</div></div>
+    </div>
+  </div>`;
+}
+
+function render() {
+  const content = document.getElementById("content");
+  const d = detail;
+
+  let html = `
+    <a href="${withController('/disruptions.html')}" style="font-size:13px; color:var(--muted); text-decoration:none;">&larr; Disruption Workspace</a>
+    <div style="display:flex; align-items:center; gap:10px; margin-top:10px;">
+      <span class="event-icon ${(d.event_type||'').toLowerCase()}">!</span>
+      <h1 style="margin:0;">${escapeHtml(d.title)}</h1>
+    </div>
+    <div class="subtitle" style="margin-top:6px;">Disruption #${d.disruption_id} · ${escapeHtml(d.narrative)}</div>
+    <div style="margin-bottom:18px;"><span class="badge ${d.status}">${d.status}</span></div>
+  `;
+
+  if (d.no_cover_requirement) {
+    html += `<div class="card"><strong>No cover requirement</strong><br>
+      <span style="color:var(--muted); font-size:13px;">${escapeHtml(d.no_cover_requirement)}</span></div>`;
+    content.innerHTML = html;
+    return;
+  }
+
+  if (d.status === "resolved" && d.commitment) {
+    html += `<div class="covered-box">
+      <div class="headline">&#10003; Covered</div>
+      <div style="margin-top:4px;">Assigned <strong>${escapeHtml(d.commitment.crew_id)}</strong>,
+        committed by ${escapeHtml(d.commitment.committed_by)}
+        (${new Date(d.commitment.committed_at).toLocaleString()})${
+          d.commitment.override_reason
+            ? ` &mdash; overrode the recommendation: "${escapeHtml(d.commitment.override_reason)}"`
+            : ""
+        }.</div>
+    </div>`;
+  }
+
+  html += renderRequirement(d);
+  html += renderContention(d);
+
+  const hasLegalOptions = (d.options || []).some((o) => o.crew_id);
+
+  if (!hasLegalOptions) {
+    html += `<div class="card" style="margin-bottom:20px;">
+      <strong>No legal option found.</strong>
+      <div style="color:var(--muted); font-size:13px; margin-top:6px;">
+        ${d.funnel && d.funnel.length ? `Considered ${d.funnel[0].count}, 0 legal — see Excluded candidates below for why each one was ruled out.` : "Nothing was checked, so this is not evidence the operation is clean."}
+      </div>
+    </div>`;
+  }
+
+  if (d.policies && Object.keys(d.policies).length) {
+    html += `<h2>Recommendations</h2><div class="policy-grid">`;
+    const labels = { balanced: "Balanced (default)", cheapest: "Cheapest", fastest: "Fastest", most_resilient: "Most resilient" };
+    if (selected === null) selected = d.policies.balanced?.crew_id ?? null;
+    for (const key of ["balanced", "cheapest", "fastest", "most_resilient"]) {
+      const p = d.policies[key];
+      if (!p) continue;
+      // Only "Balanced" is ever green -- that is the platform's own
+      // recommendation, a fixed fact about this disruption, not a function
+      // of what the controller happens to be looking at. Clicking a
+      // different card changes what "Approve & commit" will act on, shown
+      // with its own, separate "chosen" marker -- otherwise two cards that
+      // recommend the same crew member (Balanced and Most Resilient often
+      // do) would both light up green, which looks like a bug, not a tie.
+      const isRecommended = key === "balanced";
+      const isChosen = !isRecommended && p.crew_id === selected;
+      const cls = isRecommended ? "recommended" : isChosen ? "chosen" : "";
+      html += `
+        <div class="policy-card ${cls}" data-crew="${p.crew_id}" data-rank="${p.rank}">
+          <div class="name">${labels[key]}${isRecommended ? ' <span class="check">&#10003;</span>' : isChosen ? ' <span class="chosen-dot">&#9679;</span>' : ""}</div>
+          <div class="action">${escapeHtml(p.action)}</div>
+          <div class="stats">
+            <div>Cost<b>${inr(p.cost_inr)}</b></div>
+            <div>Delay<b>${p.delay_hours || 0}h</b></div>
+            <div>Resilience<b>${p.resilience}/100</b></div>
+          </div>
+        </div>`;
+    }
+    html += `</div>`;
+    html += renderPolicyExplain(d);
+  }
+
+  html += `
+    <details class="accordion" open>
+      <summary>All legal options <span class="count">${(d.options || []).filter(o=>o.crew_id).length} of ${d.funnel && d.funnel[0] ? d.funnel[0].count : '?'} considered</span> <span class="chevron">&#9662;</span></summary>
+      <div class="accordion-body" style="padding-top:8px;">
+        <div class="subtitle" style="margin-top:0;">Click any row to approve that specific option instead of one of the four recommendations above.</div>
+        <table>
+          <thead><tr><th></th><th>Rank</th><th>Action</th><th>Cost</th><th>Delay</th><th>Resilience</th><th></th></tr></thead>
+          <tbody>
+          ${(d.options || [])
+            .filter((o) => o.crew_id)
+            .map((o) => {
+              const contended = o.contended_by && o.contended_by.length;
+              const isSelected = o.crew_id === selected;
+              return `<tr class="option-row ${contended ? 'contended' : ''} ${isSelected ? 'selected' : ''}" data-crew="${o.crew_id}" data-rank="${o.rank}">
+                <td>${isSelected ? '<span style="color:var(--accent); font-weight:700;">&#10003;</span>' : ''}</td>
+                <td>#${o.rank}</td>
+                <td>${escapeHtml(o.action)}</td>
+                <td>${inr(o.cost_inr)}</td>
+                <td>${o.delay_hours || 0}h</td>
+                <td>${o.resilience ?? "-"}</td>
+                <td>${contended ? '<span class="badge open">contended</span>' : ''}</td>
+              </tr>`;
+            })
+            .join("")}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  `;
+
+  if ((d.excluded || []).length) {
+    html += `
+      <details class="accordion" style="margin-bottom:20px;">
+        <summary>Excluded candidates <span class="count">${d.excluded.length}</span> <span class="chevron">&#9662;</span></summary>
+        <div class="accordion-body" style="padding-top:8px;">
+          <table>
+            <thead><tr><th>Crew</th><th>Reason</th></tr></thead>
+            <tbody>
+            ${d.excluded
+              .map((e) => {
+                const takenTag = e.taken_by
+                  ? `<span class="taken-by-tag">taken by ${escapeHtml(e.taken_by.committed_by)}</span>`
+                  : "";
+                const ruleTags = e.taken_by
+                  ? ""  // the rule tag ("RULE-REST-04") is technically correct but
+                        // "taken by X" already says the more useful thing -- showing
+                        // both makes an already-explained exclusion look unresolved.
+                  : (e.rules || []).map((r) => `<span class="rule-tag">${r}</span>`).join("");
+                return `<tr class="excluded"><td>${escapeHtml(e.name)} (${escapeHtml(e.crew_id)})</td>
+                   <td>${escapeHtml(e.reason)} ${ruleTags}${takenTag}</td></tr>`;
+              })
+              .join("")}
+            </tbody>
+          </table>
+        </div>
+      </details>`;
+  }
+
+  if ((d.related_decisions || []).length) {
+    html += `<h2>Decisions already made</h2>
+    <div class="decisions-box">
+      ${d.related_decisions
+        .map(
+          (r) => `<div class="row">
+            <div>Assigned ${escapeHtml(r.crew_id)} <span class="meta">(${escapeHtml(r.pairing_id)}, disruption #${escapeHtml(r.disruption_id)})</span></div>
+            <div class="meta">by ${escapeHtml(r.committed_by)} · ${new Date(r.committed_at).toLocaleString()}</div>
+          </div>`
+        )
+        .join("")}
+    </div>`;
+  }
+
+  if (hasLegalOptions && d.status !== "resolved") {
+    html += `<div class="card">
+      <h2>Approving</h2>
+      <div id="approving" style="margin-bottom:14px; font-size:14px;"></div>
+      <button class="primary" id="commit-btn">Approve &amp; commit</button>
+      <div id="commit-result" style="margin-top:12px;"></div>
+    </div>`;
+  }
+
+  content.innerHTML = html;
+  renderApproving();
+
+  content.querySelectorAll(".policy-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      selected = card.dataset.crew;
+      // A full re-render, not a class toggle: whether a card shows the
+      // "chosen" marker depends on which OTHER card is Balanced too (a
+      // click can only ever add a marker to a non-Balanced card), which is
+      // simplest to just recompute the same way the initial render did.
+      render();
+    });
+  });
+
+  content.querySelectorAll(".option-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      selected = row.dataset.crew;
+      render();
+    });
+  });
+
+  const btn = document.getElementById("commit-btn");
+  if (btn) btn.addEventListener("click", commit);
+
+  const reasonEl = document.getElementById("override-reason");
+  if (reasonEl) reasonEl.addEventListener("input", updateCommitEnabled);
+
+  const jpBtn = document.getElementById("joint-plan-btn");
+  if (jpBtn) jpBtn.addEventListener("click", () => buildJointPlan(jpBtn.dataset.with));
+}
+
+let jointPlan = null;
+
+async function buildJointPlan(withIds) {
+  const resultEl = document.getElementById("joint-plan-result");
+  resultEl.innerHTML = `<div class="empty">Searching every legal combination...</div>`;
+  try {
+    jointPlan = await api(`/api/disruptions/${id}/joint-plan?with=${encodeURIComponent(withIds)}`);
+  } catch (e) {
+    resultEl.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  renderJointPlan();
+}
+
+function renderJointPlan() {
+  const resultEl = document.getElementById("joint-plan-result");
+  const jp = jointPlan;
+  resultEl.innerHTML = `
+    <div class="joint-plan-box">
+      <div style="display:flex; justify-content:space-between; align-items:baseline;">
+        <strong>Coordinated plan</strong>
+        <span style="font-size:16px; font-weight:700;">${inr(jp.total_cost_inr)}</span>
+      </div>
+      ${jp.assignments
+        .map(
+          (a) => `<div class="assign-row">
+            <div>${escapeHtml(a.disruption_title)} <span style="color:var(--muted);">(${escapeHtml(a.pairing_id)})</span><br>
+              <span style="color:var(--muted); font-size:12px;">${escapeHtml(a.action)}</span></div>
+            <div>${inr(a.cost_inr)}</div>
+          </div>`
+        )
+        .join("")}
+      <div style="font-size:12px; color:var(--muted); margin-top:10px;">
+        ${jp.equal_cost_alternatives > 0 ? `${jp.equal_cost_alternatives} other combination(s) cost exactly the same. ` : ""}
+        ${escapeHtml(jp.note)}
+      </div>
+      <button class="primary" id="joint-commit-btn" style="margin-top:14px;">
+        Approve joint plan — ${inr(jp.total_cost_inr)}
+      </button>
+      <div style="font-size:12px; color:var(--muted); margin-top:8px;">
+        One approval, one transaction — every leg is re-checked against the live roster the
+        instant this is pressed. If any leg has gone stale since this plan was built, none of
+        it is recorded.
+      </div>
+      <div id="joint-commit-result" style="margin-top:12px;"></div>
+    </div>
+  `;
+  document.getElementById("joint-commit-btn").addEventListener("click", commitJointPlan);
+}
+
+async function commitJointPlan() {
+  const btn = document.getElementById("joint-commit-btn");
+  const resultEl = document.getElementById("joint-commit-result");
+  btn.disabled = true;
+  resultEl.innerHTML = `<span class="empty">Committing...</span>`;
+  try {
+    const payload = {
+      committed_by: getController(),
+      assignments: jointPlan.assignments.map((a) => ({
+        disruption_id: a.disruption_id, pairing_id: a.pairing_id,
+        crew_id: a.crew_id, rank: a.rank,
+      })),
+    };
+    await apiPost(`/api/disruptions/${id}/commit-joint`, payload);
+    resultEl.innerHTML = `<div style="color:var(--accent); font-weight:600;">
+      Joint plan committed — every leg landed together.</div>`;
+    await refresh();
+  } catch (e) {
+    resultEl.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}
+      Nothing was recorded — re-plan and try again.</div>`;
+    btn.disabled = false;
+  }
+}
+
+function isOverride() {
+  const option = (detail.options || []).find((o) => o.crew_id === selected);
+  const balanced = detail.policies && detail.policies.balanced;
+  return !!(option && balanced && option.crew_id !== balanced.crew_id);
+}
+
+function renderApproving() {
+  const el = document.getElementById("approving");
+  if (!el) return;
+  const option = (detail.options || []).find((o) => o.crew_id === selected);
+  if (!option) {
+    el.innerHTML = `<span class="empty">Pick a recommendation or an option above.</span>`;
+    return;
+  }
+
+  let html = `<strong>${escapeHtml(option.action)}</strong> — ${inr(option.cost_inr)}`;
+  if (isOverride()) {
+    html += `
+      <div class="override-box">
+        <strong style="color:var(--warn);">&#9888; Overrides the recommendation</strong>
+        <div style="margin-top:6px;">Reason for overriding the recommendation</div>
+        <textarea id="override-reason" placeholder="Why this option over the recommended one?"></textarea>
+      </div>`;
+  }
+  el.innerHTML = html;
+  updateCommitEnabled();
+}
+
+function updateCommitEnabled() {
+  const btn = document.getElementById("commit-btn");
+  if (!btn) return;
+  const reasonEl = document.getElementById("override-reason");
+  btn.disabled = isOverride() && !(reasonEl && reasonEl.value.trim());
+}
+
+async function commit() {
+  const btn = document.getElementById("commit-btn");
+  const resultEl = document.getElementById("commit-result");
+  const option = (detail.options || []).find((o) => o.crew_id === selected);
+  if (!option) return;
+  const reasonEl = document.getElementById("override-reason");
+  const overrideReason = reasonEl ? reasonEl.value.trim() : "";
+  if (isOverride() && !overrideReason) return;
+
+  btn.disabled = true;
+  resultEl.innerHTML = `<span class="empty">Committing...</span>`;
+  try {
+    const result = await apiPost(`/api/disruptions/${id}/commit`, {
+      crew_id: option.crew_id,
+      committed_by: getController(),
+      accepted_rank: option.rank,
+      override_reason: overrideReason || undefined,
+    });
+    resultEl.innerHTML = `<div style="color:var(--accent); font-weight:600;">
+      Committed: ${escapeHtml(result.name)} (${escapeHtml(result.crew_id)}) to ${escapeHtml(result.pairing_id)}.</div>`;
+    await refresh();
+  } catch (e) {
+    resultEl.innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+    btn.disabled = false;
+  }
+}
+
+load();
+</script>
+</body>
+</html>

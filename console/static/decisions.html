@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Decision Ledger — Crew Ops Agent-a-thon</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="app.js"></script>
+<script>
+async function load() {
+  await renderShell("decisions");
+  const content = document.getElementById("content");
+  content.innerHTML = `
+    <h1>Decision Ledger</h1>
+    <div class="subtitle">Every commit, from every controller — a real row in the same <code>controller_decisions</code> audit table this dataset's schema already defines.</div>
+    <div class="card" id="body"><div class="empty">Loading...</div></div>
+  `;
+  try {
+    const rows = await api("/api/decisions");
+    document.getElementById("body").innerHTML = rows.length
+      ? `<table>
+          <thead><tr><th>Disruption</th><th>Decided (UTC)</th><th>Type</th><th>Rank accepted</th></tr></thead>
+          <tbody>
+          ${rows
+            .map(
+              (r) => `<tr>
+                <td>${escapeHtml(r.disruption_id)}</td>
+                <td>${r.decided_at_utc.replace("T", " ").slice(0, 19)}</td>
+                <td>${escapeHtml(r.decision_type)}</td>
+                <td>${r.accepted_rank ?? (r.custom_crew_id ? "override: " + r.custom_crew_id : "-")}</td>
+              </tr>`
+            )
+            .join("")}
+          </tbody>
+        </table>`
+      : `<div class="empty">No decisions committed yet — this fills in from the Disruption Workspace.</div>`;
+  } catch (e) {
+    document.getElementById("body").innerHTML = `<div class="error-banner">${escapeHtml(e.message)}</div>`;
+  }
+}
+load();
+</script>
+</body>
+</html>
