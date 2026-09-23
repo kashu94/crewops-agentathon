@@ -19,8 +19,9 @@ from datetime import date, timedelta
 from typing import Any
 
 import config
-from entities import stated_ranks
+from entities import stated_bases, stated_ranks, stated_rank_names, stated_ratings
 from router import Route
+from tools import crew_named
 from schemas import (
     BlastRadius,
     ConsequenceAnswer,
@@ -35,8 +36,6 @@ from schemas import (
     TraceEntry,
     Verdict,
 )
-from tools import TOOL_SCHEMAS, schemas_for_port
-
 
 @dataclass(slots=True)
 class ToolCall:
@@ -45,43 +44,6 @@ class ToolCall:
     id: str
     name: str
     args: dict[str, Any] = field(default_factory=dict)
-
-
-# --------------------------------------------------------------------------
-# Which tools a given intent needs
-# --------------------------------------------------------------------------
-
-_INTENT_TOOLS: dict[Intent, tuple[str, ...]] = {
-    Intent.LOOKUP_ROSTER: ("lookup",),
-    Intent.LOOKUP_RESERVE: ("lookup",),
-    Intent.LOOKUP_CREW: ("lookup",),
-    Intent.LOOKUP_FLIGHT: ("lookup",),
-    Intent.LOOKUP_CERT: ("lookup",),
-    Intent.LOOKUP_RISK: ("lookup",),
-    Intent.DRAFT_NOTIFICATION: ("notification_brief", "lookup"),
-    Intent.LOOKUP_DUTY_CLOCK: ("duty_clock",),
-    Intent.EXPLAIN_RULE: ("explain_rule",),
-    Intent.CHECK_GATE: ("check_gate",),
-    Intent.CHECK_LEGALITY: ("check_legality", "explain_rule"),
-    Intent.FIND_REPLACEMENT: ("find_options", "check_legality"),
-    Intent.IMPACT_OF_EVENT: ("ripple", "lookup"),
-    Intent.RANK_OPTIONS: ("find_options", "ripple", "check_legality"),
-    Intent.SIMULATE_WHATIF: ("simulate", "ripple", "find_options"),
-    Intent.JOINT_PLAN: ("joint_plan", "find_options"),
-    Intent.RESOLVE_ILLEGAL: ("check_legality", "find_options", "ripple"),
-}
-
-
-def tools_for(intent: Intent, port: Any = None) -> list[dict[str, Any]]:
-    """Narrow the toolset to what this intent can plausibly need.
-
-    A tier-1 lookup does not get `joint_plan` in its schema list. Fewer, more
-    relevant tools measurably improves selection and cuts prompt size.
-    """
-    schemas = schemas_for_port(port) if port is not None else TOOL_SCHEMAS
-    allowed = set(_INTENT_TOOLS.get(intent, ()))
-    narrowed = [t for t in schemas if t["name"] in allowed]
-    return narrowed or schemas
 
 
 MISSING_FOR_INTENT: dict[Intent, str] = {
@@ -188,12 +150,17 @@ def _cert_filters(ents: Any) -> dict[str, Any]:
     return filters
 
 
-def seed_calls(route: Route) -> list[ToolCall]:
+def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
     """First tool calls implied by the entities, before the model is consulted.
 
     The router already extracted the ids deterministically, so for the common
     shapes we know the opening move. This saves a round-trip and guarantees
     the model sees real data before it says anything.
+
+    `query` is the controller's raw text -- only needed for EXPLAIN_RULE's
+    no-rule-id fallback (search_rules() has no id to work from, only the
+    question itself). Every other case here works from `route.entities`
+    alone, same as before this parameter existed.
     """
     ents = route.entities
     calls: list[ToolCall] = []
@@ -205,6 +172,14 @@ def seed_calls(route: Route) -> list[ToolCall]:
         case Intent.EXPLAIN_RULE if ents.rule_ids:
             for rule_id in ents.rule_ids:
                 add("explain_rule", rule_id=rule_id)
+
+        case Intent.EXPLAIN_RULE if query:
+            # No rule id named -- a paraphrase ("can duty run long on a
+            # short day"). search_rules() is a real hybrid-search tool
+            # call, not a guess: it returns [] (not a wrong answer) if the
+            # ledger or embedding model isn't configured, same discipline
+            # as every other Postgres-backed feature in this repo.
+            add("search_rules", query=query)
 
         case Intent.LOOKUP_DUTY_CLOCK if ents.primary_crew:
             add("duty_clock", crew_id=ents.primary_crew, date=ents.primary_date)
@@ -227,6 +202,31 @@ def seed_calls(route: Route) -> list[ToolCall]:
                 boarding_gate_number=ents.primary_gate,
                 delay_minutes=ents.delay_minutes or 0.0,
                 at_utc=at_utc)
+
+        case Intent.CHECK_GATE:
+            # No flight or gate named -- an aggregate question ("how many
+            # boarding gates are there", or, with a date, "how many were
+            # occupied on 16 Sep"). Any station or date the question DID
+            # name still scopes the aggregate -- "how many gates does
+            # Bangalore occupy" silently answering for every station would
+            # be a different, wrong-looking number. check_gate() returns
+            # real counts from the dataset either way (see
+            # core_engine/port.py), so this still answers from real data
+            # instead of falling through to explain_no_tools()'s "I need a
+            # flight or gate" decline for a question that was never about
+            # one specific gate.
+            add("check_gate",
+                station=ents.stations[0] if ents.stations else None,
+                date=ents.primary_date)
+
+        # Deliberately no seed here for Intent.LOOKUP_CONTROLLERS: whether
+        # the question needs the roster (list_controllers) or the workload
+        # (controller_issue_counts) is a real choice between two tools with
+        # different meanings, not a fact the entities already pinned down --
+        # exactly the kind of decision the Resolution Advisor Agent's own
+        # tool loop exists to make, not something to pre-empt with a second
+        # keyword regex here.
+
         case Intent.LOOKUP_CERT:
             add("lookup", entity="certifications", filters=_cert_filters(ents))
 
@@ -236,6 +236,12 @@ def seed_calls(route: Route) -> list[ToolCall]:
 
         case Intent.LOOKUP_CREW if _crew_filters(ents):
             add("lookup", entity="crew", filters=_crew_filters(ents))
+
+        case Intent.LOOKUP_CREW if ents.malformed_crew_ids:
+            # "C-10" isn't a real id shape -- nothing to look up, but real
+            # neighbours are, so the answer can offer them instead of
+            # reading as though nothing was asked at all.
+            add("suggest_crew_ids", near=ents.malformed_crew_ids[0])
 
         case Intent.LOOKUP_ROSTER if ents.primary_pairing:
             add("lookup", entity="pairing_crew",
@@ -352,9 +358,14 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
         # A single fact-check, not a listing: the seed's call is the one that
         # actually answers the literal question (its args come from the
         # parsed question), so it wins over anything the model re-ran later
-        # with different arguments.
-        first = next((e.result for e in trace
-                     if e.tool == "check_gate" and e.result is not None), None)
+        # with different arguments -- including when the seed's call is the
+        # one that *failed* (e.g. a date outside the dataset). Skipping past
+        # that error to any later, differently-scoped success would present
+        # an answer to a question nobody asked as though it answered the one
+        # that was asked; an empty answer here instead falls through to
+        # `render_unavailable()`, which surfaces the seed call's real error.
+        first_entry = next((e for e in trace if e.tool == "check_gate"), None)
+        first = first_entry.result if first_entry and not first_entry.error else None
         return LookupAnswer(rows=[first] if first else [])
 
     if route.intent is Intent.DRAFT_NOTIFICATION:
@@ -363,6 +374,41 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
         brief = results.get("notification_brief") or {}
         return NotificationAnswer(
             message=notify.render(brief) if brief else "", brief=brief)
+
+    if "same_pairing" in results:
+        # A verdict, not a listing -- same failure mode as CHECK_GATE above.
+        # The model often runs an exploratory `lookup` (e.g. "list all
+        # Captains") before or after the decisive call, and folding both
+        # into one rows list risks the actual verdict getting pushed past
+        # ROW_LIMIT by an unrelated large table and silently truncated out
+        # of what the Explainer ever sees.
+        return LookupAnswer(rows=[results["same_pairing"]])
+
+    if "suggest_crew_ids" in results:
+        # A "did you mean" list, not a set of matches -- none of these rows
+        # answer the question that named the malformed id, they're
+        # candidates for the controller to pick from. A bare table of
+        # real-looking crew rows with nothing saying so reads as "here are
+        # the matches" to the Explainer, which then (correctly, given what
+        # it was shown) summarizes it as "the id isn't in the data" -- true,
+        # but throwing away the one useful thing this tool call was for.
+        malformed = route.entities.malformed_crew_ids
+        return LookupAnswer(rows=[{
+            "requested_id": malformed[0] if malformed else None,
+            "exists_in_dataset": False,
+            "nearest_real_crew_ids": results["suggest_crew_ids"] or [],
+        }])
+
+    if "search_rules" in results:
+        # A paraphrased rule question can land on almost any intent
+        # depending on its wording ("how long do crew have to rest between
+        # duties" reads as CHECK_LEGALITY to the router's own regex, not
+        # EXPLAIN_RULE), so the tier-specific branches below -- keyed to
+        # what a *legality* or *lookup* question needs -- never think to
+        # look for this tool's result at all, even though it ran and
+        # succeeded. Surfaced here unconditionally so a real answer never
+        # gets silently dropped just because the intent guess was off.
+        return LookupAnswer(rows=results["search_rules"] or [])
 
     if route.tier is Tier.LOOKUP:
         rows: list[dict[str, Any]] = []
@@ -422,13 +468,16 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
     )
 
 
-def rank_mismatch(query: str, port: Any) -> str | None:
-    """A rank the query asserts that the roster contradicts.
+def stated_attribute_mismatch(query: str, port: Any) -> str | None:
+    """An attribute the query asserts about a named crew member that the
+    roster contradicts -- rank, base, or aircraft rating.
 
-    A controller typing "FO C-2087" when the roster says C-2087 is a Captain
-    has either misremembered the seat or means a different person, and both
-    change the answer. Accepting it silently is the failure; the roster
-    knows, so it should say.
+    A controller typing "FO C-2087" when the roster says C-2087 is a
+    Captain, or "the DEL-based C-1042" when C-1042 is BLR-based, has either
+    misremembered or means a different person, and both change the answer.
+    Accepting it silently is the failure; the roster knows, so it should
+    say -- the same check, just not limited to rank, the one attribute this
+    used to be scoped to (the function was named `rank_mismatch`).
     """
     for crew_id, claimed in stated_ranks(query):
         try:
@@ -442,4 +491,47 @@ def rank_mismatch(query: str, port: Any) -> str | None:
             return (f"{crew_id} is a {actual}, not a {claimed}. "
                     f"Did you mean a different crew member, or shall I "
                     f"proceed with {crew_id} as {actual}?")
+
+    for name, claimed in stated_rank_names(query):
+        try:
+            matches = crew_named(port, name)
+        except Exception:
+            continue
+        if not matches or any(m.get("rank") == claimed for m in matches):
+            # No one by that name at all is a different tool's problem to
+            # report; at least one real match holding the claimed rank means
+            # this isn't a mismatch, even if a same-named person elsewhere
+            # holds a different one.
+            continue
+        candidates = ", ".join(f"{m['crew_id']} ({m.get('rank')})" for m in matches)
+        return (f"{name} is not a {claimed} in the roster -- {candidates}. "
+                f"Did you mean one of those, under their real rank, or a "
+                f"different person?")
+
+    for crew_id, claimed in stated_bases(query):
+        try:
+            rows = port.lookup("crew", {"crew_id": crew_id})
+        except Exception:
+            continue
+        if not rows:
+            continue
+        actual = rows[0].get("base")
+        if actual and actual != claimed:
+            return (f"{crew_id} is based at {actual}, not {claimed}. "
+                    f"Did you mean a different crew member, or shall I "
+                    f"proceed with {crew_id} as {actual}-based?")
+
+    for crew_id, claimed in stated_ratings(query):
+        try:
+            rows = port.lookup("crew", {"crew_id": crew_id})
+        except Exception:
+            continue
+        if not rows:
+            continue
+        ratings = rows[0].get("ratings") or []
+        if ratings and claimed not in ratings:
+            have = "/".join(ratings)
+            return (f"{crew_id} is rated on {have}, not {claimed}. "
+                    f"Did you mean a different crew member, or shall I "
+                    f"proceed with {crew_id} as {have}-rated?")
     return None

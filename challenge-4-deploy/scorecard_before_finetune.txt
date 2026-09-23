@@ -1,0 +1,80 @@
+=== Step 1: Ensure Agents Are Deployed ===
+  Found existing: crew-triage-agent
+  Found existing: crew-resolution-advisor-agent
+  Found existing: crew-explainer-agent
+
+=== Step 2: Gold-Question Scorecard ===
+  [PASS] Q01 (tier 1): Who is on reserve at BLR on 2026-09-15, and what are their on-call windows?
+  [PASS] Q02 (tier 1): As of the snapshot, how many duty hours has C-1042 accrued in the 7 calendar days ending 2026-09-14?
+  [PASS] Q03 (tier 1): Which flights depart DEL on 2026-09-15?
+  [PASS] Q04 (tier 1): List all certifications expiring within 30 days of 2026-09-15.
+  [PASS] Q05 (tier 1): Which aircraft operates DX412 on 2026-09-15, and how many seats does it have?
+  [PASS] Q06 (tier 1): What is C-3310's reserve on-call window and reachability?
+  [PASS] Q07 (tier 1): What is C-2210's base and rating?
+  [PASS] Q08 (tier 1): Which crew are assigned to pairing P-2291, and in what roles?
+  [PASS] Q09 (tier 1): Which flights fly BLR→BOM on 2026-09-17?
+  [PASS] Q10 (tier 1): How many flights operate on 2026-09-16 in total?
+  [PASS] Q11 (tier 1): How many captains are based at DEL, and who are they?
+  [PASS] Q12 (tier 1): What is the longest block time in the schedule, and which flights have it?
+  [PASS] Q13 (tier 1): What is C-2087's rank, and total flight hours over the 28 days ending 2026-09-14?
+  [PASS] Q14 (tier 1): Which stations does the network serve nonstop from BLR?
+  [PASS] Q15 (tier 1): Who is the Senior Cabin Crew on VT-DXB's pairing on 2026-09-16?
+  [PASS] Q16 (tier 1): What is the disruption-risk score for C-1042 and what drives it?
+  [PASS] Q17 (tier 2): Captain C-1042 calls in sick at 05:00Z on 15 Sep for pairing P-2291. Who do I use?
+  [PASS] Q18 (tier 2): If Captain C-2087 is assigned to cover P-2291 from 15 Sep, does any rule breach?
+  [PASS] Q19 (tier 2): BLR is closed 08:00–14:00Z on 17 Sep. Which flights are affected?
+  [PASS] Q20 (tier 2): VT-DXA is delayed 90 minutes before DX401 on 16 Sep. Does the rostered crew still clear?
+  [PASS] Q21 (tier 2): Can C-2210 (DEL base) legally cover P-2291 if positioned to BLR on the day?
+  [PASS] Q22 (tier 2): Can C-5417 legally operate their rostered VT-DXB duty on 19 Sep?
+  [PASS] Q23 (tier 2): A crew is released at 15:30Z on 16 Sep. What is the earliest they may report next?
+  [PASS] Q24 (tier 2): Can reserve C-3305 cover the FULL pairing P-2291 (both days)? Why or why not?
+  [PASS] Q25 (tier 2): If DX404 on 16 Sep is cancelled, how many passengers are affected and why?
+  [PASS] Q26 (tier 2): Which crew have 45 or more duty hours in the 7 days ending 2026-09-15?
+  [PASS] Q27 (tier 2): The VT-DXE captain is sick on 16 Sep (called 01:30Z). Which reserve can cover?
+  [PASS] Q28 (tier 2): Captain C-5837 (VT-DXA line, works 14/17/20 Sep) is proposed to cover an extra duty — legal?
+  [PASS] Q29 (tier 2): Station HYD is closed 05:00–09:00Z on 19 Sep. Which flights are affected?
+  [PASS] Q30 (tier 2): Which single flight leg has the most seats at risk if cancelled, and why?
+  [PASS] Q31 (tier 3): Captain C-1042 is out for pairing P-2291 (15–16 Sep). Produce ranked replacement options.
+  [PASS] Q32 (tier 3): Both A320 captains (VT-DXA and VT-DXB) are sick at 00:30Z on 18 Sep. Give a joint recovery plan.
+  [PASS] Q33 (tier 3): After the 90-minute delay to VT-DXA on 16 Sep, what should Crew Control do next?
+  [PASS] Q34 (tier 3): C-5417's recurrent training lapsed. Resolve their 19 Sep assignment.
+  [PASS] Q35 (tier 3): BLR closes 08:00–14:00Z on 17 Sep. Outline the recovery plan across affected pairings.
+  [PASS] Q36 (tier 3): Draft the callout notification to C-3310 for covering P-2291.
+  [PASS] Q37 (tier 3): What is the cheapest legal way to cover the VT-DXF First Officer on 20 Sep?
+  [  ? ] Q38 (tier 3): If the desk wants a standing morning briefing, which three data points per aircraft line should it surface and why? (open-ended per dataset — judged on operational reasoning, not exact match)
+
+============================================================
+CREW OPS ADVISOR — GOLD QUESTION SCORECARD
+============================================================
+  Tier 1 — Lookup          16/16 verified
+  Tier 2 — Replacement     14/14 verified
+  Tier 3 — Consequence     7/8 verified
+  TOTAL                    37/38 verified
+============================================================
+
+============================================================
+CREATING WORKFLOW AGENT VIA SDK
+============================================================
+  Created workflow agent: crew-ops-advisor-workflow (version 1)
+  Visible in Foundry portal -> Build -> Agents (kind: workflow)
+
+============================================================
+INVOKING WORKFLOW (BACKGROUND POLL)
+============================================================
+
+=== Portal Workflow: crew-ops-advisor-workflow ===
+  Query: Who is on reserve at BLR?
+  Response ID : wfresp_060a20bece682fd4007PcRGMiTGTvjYuTioSJj4XFfZGimA6d8
+  [1] status=completed
+
+Workflow output:
+{"intent": "LOOKUP_RESERVE", "confidence": "high"}
+
+============================================================
+CHALLENGE 4 COMPLETE
+============================================================
+  Part A: Sequential SDK orchestration + verifier gate  DONE
+  Part B: Workflow agent deployed                      DONE  (crew-ops-advisor-workflow)
+          -> View in Foundry portal -> Build -> Agents
+
+--- Model used for Advisor Agent: crew-ops-advisor-model (base gpt-4o, before fine-tuning) ---

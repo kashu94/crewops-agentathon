@@ -63,13 +63,21 @@ body {
   color: var(--text);
 }
 
-.shell { display: flex; min-height: 100vh; }
+/* Fixed height, not min-height: with min-height, a tall page (a long
+   disruption detail view) stretches the whole flex row taller than the
+   viewport, so the sidebar -- just another flex child -- scrolls away with
+   it instead of staying put. Pinning `.shell` to exactly 100vh and letting
+   `.content` (not `.main` as a whole) be the one scrollable region inside
+   it is what actually keeps the sidebar and topbar fixed. */
+.shell { display: flex; height: 100vh; }
 
 .sidebar {
   width: 232px;
   flex-shrink: 0;
   background: var(--sidebar-bg);
   padding: 22px 14px;
+  height: 100vh;
+  overflow-y: auto;
 }
 
 .brand {
@@ -94,7 +102,7 @@ body {
 .nav-icon { width: 18px; height: 18px; flex-shrink: 0; display: inline-flex; opacity: 0.9; }
 .nav-icon svg { width: 100%; height: 100%; }
 
-.main { flex: 1; min-width: 0; }
+.main { flex: 1; min-width: 0; height: 100vh; display: flex; flex-direction: column; }
 
 .topbar {
   display: flex;
@@ -103,6 +111,7 @@ body {
   padding: 14px 28px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+  flex-shrink: 0;
 }
 
 .controller-switch { display: flex; gap: 8px; align-items: center; font-size: 13px; }
@@ -129,7 +138,7 @@ body {
 .who-name { font-size: 13.5px; font-weight: 600; line-height: 1.25; }
 .who-role { font-size: 11.5px; color: var(--muted); line-height: 1.25; }
 
-.content { padding: 24px 28px; max-width: 1100px; }
+.content { padding: 24px 28px; max-width: 1100px; overflow-y: auto; flex: 1; }
 
 .card {
   background: var(--panel);

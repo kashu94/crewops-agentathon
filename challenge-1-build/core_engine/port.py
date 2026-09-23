@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 from collections import Counter
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
@@ -22,7 +23,11 @@ from pathlib import Path
 from typing import Any
 
 import config
-from tools import ToolError, resolve_filters, row_matches, with_crew_identity
+from entities import CREW_RE, RANK_WORD_RE_FRAGMENT, RANK_WORD_TO_RANK
+from tools import (
+    ToolError, crew_named, resolve_filters, row_matches, suggest_crew_names,
+    with_crew_identity,
+)
 from core_engine import rules
 from core_engine.duty import MAX_DUTY_HOURS_7D, MAX_FLIGHT_HOURS_28D
 from core_engine.gates import GateWorld, iso, load_gates, next_at_gate, occupant_at, parse
@@ -113,10 +118,45 @@ class JsonToolPort:
 
     # -- Tool 1: lookup ------------------------------------------------------
 
+    # Filter keys that name a specific real-world identifier rather than a
+    # descriptive attribute -- an equality filter on one of these that
+    # matches nothing is far more often a malformed or invented id (a
+    # transposed digit, a made-up pairing) than a genuine "no such record",
+    # so it is worth telling the id universe apart from an ordinary filter
+    # miss (e.g. `{"rank": "Captain", "base": "XYZ"}` legitimately matching
+    # zero rows needs no such check).
+    _ID_FIELD_KIND = {"crew_id": "crew", "pairing_id": "pairing", "flight_id": "flight"}
+
     def lookup(self, entity: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        resolved = resolve_filters(entity, filters, self.entity_fields(entity))
         rows = self._rows(entity)
-        for key, want in resolve_filters(entity, filters, self.entity_fields(entity)).items():
+        for key, want in resolved.items():
             rows = [r for r in rows if row_matches(r, key, want)]
+
+        if not rows:
+            # An empty result for a real id (just excluded by some other
+            # filter) is a legitimate answer and must not raise here --
+            # `require()` only raises when the id itself doesn't exist, so
+            # this only ever intercepts the invented/malformed-id case.
+            for key, want in resolved.items():
+                if (kind := self._ID_FIELD_KIND.get(key)) and isinstance(want, str):
+                    self.require(kind, want)
+
+            # Same discipline for a crew name that matched nobody -- "A.
+            # Nayar" is far more often a typo of a real crew member ("A.
+            # Nair") than a genuine "no such person", so this is worth
+            # telling apart from an ordinary filter miss the same way a
+            # malformed id already is, just above.
+            if entity == "crew" and isinstance(resolved.get("name"), str):
+                suggestions = suggest_crew_names(self, resolved["name"])
+                if suggestions:
+                    listing = ", ".join(
+                        f"{s['name']} ({s['crew_id']}, {s.get('rank')})" for s in suggestions)
+                    raise ToolError(
+                        "NEEDS_CONFIRMATION",
+                        f"No crew named {resolved['name']!r}. Did you mean "
+                        f"{listing}? Confirm which and I will run it — I will not guess.")
+
         if entity == "reserves":
             rows = with_crew_identity(rows, self._rows("crew"))
         return rows
@@ -171,6 +211,60 @@ class JsonToolPort:
             if rule["rule_id"] == rule_id:
                 return rule
         raise ToolError("UNRESOLVED_ENTITY", f"no rule {rule_id!r}")
+
+    # -- Tool 11: search_rules --------------------------------------------
+    # Only for a paraphrased legality question that never names a rule id --
+    # explain_rule above is the exact-id path and stays the first choice
+    # whenever a rule id is actually given. A no-op ([]) when the ledger or
+    # the embedding model isn't configured (see core_engine/rule_search.py).
+
+    def search_rules(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+        from core_engine import rule_search
+        return rule_search.search_rules(query, top_k=top_k)
+
+    # -- Tool 12: suggest_crew_ids -----------------------------------------
+    # For a crew id shaped wrong ("C-10", not the dataset's 4-digit ids) --
+    # deterministic digit-prefix comparison against the real roster, never
+    # embedding-based: identity resolution stays exact everywhere else in
+    # this system, and a "did you mean" is no exception -- it only ever
+    # NAMES candidates for a human to pick from, never picks one itself.
+
+    def suggest_crew_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]:
+        from core_engine.resolve import _digit_prefix_matches
+
+        crew_rows = {r["crew_id"]: r for r in self._rows("crew")}
+        matches = _digit_prefix_matches(near, list(crew_rows), limit)
+        return [
+            {"crew_id": cid, "name": crew_rows[cid].get("name"),
+             "rank": crew_rows[cid].get("rank"), "base": crew_rows[cid].get("base")}
+            for cid in matches
+        ]
+
+    # -- Tool 14: list_controllers ---------------------------------------------
+
+    def list_controllers(self) -> list[dict[str, Any]]:
+        """The controller desks sharing this operation. Not a crew role --
+        a controller dispatches, none of them fly, so this is never
+        confusable with a `lookup(entity='crew', ...)` result."""
+        return [dict(c) for c in config.CONTROLLERS]
+
+    # -- Tool 15: controller_issue_counts ---------------------------------
+
+    def controller_issue_counts(self) -> list[dict[str, Any]]:
+        """How many of the dataset's engineered disruption scenarios are
+        still open at each desk, from the live ledger -- not a static count,
+        since a controller may already have committed a decision on one.
+        A scenario never registered in the ledger yet counts as open: the
+        console never seeds it as "closed" ahead of a real decision."""
+        from core_engine import ledger
+
+        statuses = {row["disruption_id"]: row["status"]
+                    for row in ledger.list_open_disruptions()} if ledger.enabled() else {}
+        counts = {c["name"]: 0 for c in config.CONTROLLERS}
+        for scenario_id, desk in config.SCENARIO_DESKS.items():
+            if statuses.get(scenario_id, "open") == "open":
+                counts[desk] = counts.get(desk, 0) + 1
+        return [{"controller": name, "open_issues": count} for name, count in counts.items()]
 
     # -- entity resolution ----------------------------------------------------
 
@@ -260,8 +354,58 @@ class JsonToolPort:
 
     def check_gate(self, flight_id: str | None = None, flight_no: str | None = None,
                    date: str | None = None, boarding_gate_number: str | None = None,
-                   delay_minutes: float = 0.0, at_utc: str | None = None) -> dict[str, Any]:
+                   delay_minutes: float = 0.0, at_utc: str | None = None,
+                   station: str | None = None) -> dict[str, Any]:
         gates = self.gates
+
+        # Nothing named at all: an aggregate question. Two different
+        # aggregates share this branch, told apart by whether a date was
+        # given -- "how many boarding gates are there" (static inventory,
+        # true regardless of date) versus "how many gates were occupied on
+        # <date>" (which flights actually used a gate that day). Answering
+        # the second with the first's number silently substitutes "how many
+        # gates exist" for "how many were busy", which is a different
+        # question with a different, usually larger, answer. Either one can
+        # additionally be scoped to a single station -- "how many gates
+        # does Bangalore occupy" silently answering for every station would
+        # be a different, wrong-looking number.
+        if not flight_id and not flight_no and not boarding_gate_number:
+            all_gates = sorted(
+                g for g in gates.by_gate if not station or g.startswith(f"{station}-")
+            )
+            if date:
+                if not (config.WEEK_START <= str(date) <= config.WEEK_END):
+                    raise ToolError(
+                        "UNRESOLVED_ENTITY",
+                        f"{date} is outside the dataset -- it only covers "
+                        f"{config.WEEK_START} to {config.WEEK_END}.")
+                occupied = sorted(
+                    g for g in all_gates
+                    if any(r.get("date") == date for r in gates.by_gate[g])
+                )
+                by_station: dict[str, int] = {}
+                for gate_number in occupied:
+                    st = gate_number.split("-", 1)[0]
+                    by_station[st] = by_station.get(st, 0) + 1
+                return {
+                    "date": date,
+                    "station": station,
+                    "occupied_boarding_gates": len(occupied),
+                    "of_boarding_gates_available": len(all_gates),
+                    "occupied_by_station": dict(sorted(by_station.items())),
+                    "occupied_gate_numbers": occupied,
+                }
+
+            by_station = {}
+            for gate_number in all_gates:
+                st = gate_number.split("-", 1)[0]
+                by_station[st] = by_station.get(st, 0) + 1
+            return {
+                "station": station,
+                "total_boarding_gates": len(all_gates),
+                "gates_by_station": dict(sorted(by_station.items())),
+                "boarding_gate_numbers": all_gates,
+            }
 
         # No flight named: a pure occupancy question -- "is BLR-G1 blocked
         # right now / at this instant". Free ends up meaning no aircraft
@@ -282,6 +426,17 @@ class JsonToolPort:
                 "occupying_pairing_id": occupant["pairing_id"] if occupant else None,
                 "occupied_from": occupant["boarding_start_time"] if occupant else None,
                 "occupied_until": occupant["boarding_end_time"] if occupant else None,
+                # Every flight scheduled into this gate this week, not just
+                # the one instant above -- "which flights use gate X" asks
+                # for the whole week, and there is no single instant that
+                # answers that question, so both are always returned rather
+                # than making the model guess which framing to ask for.
+                "schedule": [
+                    {"flight_id": r["flight_id"], "pairing_id": r["pairing_id"],
+                     "boarding_start_time": r["boarding_start_time"],
+                     "boarding_end_time": r["boarding_end_time"]}
+                    for r in gates.by_gate.get(boarding_gate_number, ())
+                ],
             }
 
         # Named by flight. resolve_flight already reports a wrong date by
@@ -347,10 +502,93 @@ class JsonToolPort:
             "pairing_id": pairing_id,
             "legal": c.legal,
             "rules_checked": list(rules.ALL_RULES),
+            # Every evaluated rule, not just the blocking ones -- a passing
+            # rule's used/limit/headroom (e.g. "9.5h of 12.5h") is real data
+            # a question can ask about even when a different rule fails.
+            # The concise "show failures, else show all" display filtering
+            # already happens downstream in explainer.render_verdicts().
             "verdicts": [asdict(v) | {"status": str(v.status)}
-                         for v in (rules.blocking(c.verdicts) or c.verdicts[:7])],
+                         for v in c.verdicts[:7]],
             "cost_inr": c.cost_inr,
             "delay_hours": c.delay_hours,
+        }
+
+    # -- Tool 16: same_pairing -------------------------------------------------
+
+    # A rank word stated ahead of a name -- "Captain A. Nair" -- disambiguates
+    # exactly the same way `entities.STATED_RANK_RE` does for "Captain
+    # C-2087": several surnames in this roster repeat across ranks (two
+    # "A. Nair"s: a Captain and Cabin Crew), so the rank the controller
+    # actually said is real signal, not something to discard before matching.
+    # Built from the same shared word list `entities.py` owns, rather than a
+    # separate copy that could drift out of sync with it.
+    _RANK_PREFIX_RE = re.compile(rf"^({RANK_WORD_RE_FRAGMENT})\s+(.+)$", re.I)
+
+    def _resolve_person(self, value: str) -> dict[str, Any]:
+        """A crew record from whatever the controller wrote -- a crew id, or
+        a name optionally preceded by a rank ("Captain A. Nair"). Never
+        guesses between two same-named, same-rank crew; the caller asks."""
+        value = (value or "").strip()
+        if not value:
+            raise ToolError("UNRESOLVED_ENTITY", "a crew id or name is required")
+
+        if CREW_RE.fullmatch(value):
+            self.require("crew", value)
+            return self.lookup("crew", {"crew_id": value})[0]
+
+        name, rank_hint = value, None
+        if m := self._RANK_PREFIX_RE.match(value):
+            word = m.group(1).lower().replace(".", "").replace("/", "").strip()
+            rank_hint = RANK_WORD_TO_RANK.get(word) or RANK_WORD_TO_RANK.get(word.replace("-", ""))
+            if rank_hint:
+                name = m.group(2).strip()
+
+        matches = crew_named(self, name)
+        if rank_hint:
+            matches = [c for c in matches if c.get("rank") == rank_hint] or matches
+        if not matches:
+            raise ToolError("UNRESOLVED_ENTITY", f"no crew member named {value!r}")
+        if len(matches) > 1:
+            options = ", ".join(
+                f"{m['crew_id']} ({m['rank']}, {m['base']})" for m in matches)
+            raise ToolError(
+                "NEEDS_CONFIRMATION",
+                f"{len(matches)} crew members are named {name!r}: {options}. "
+                f"Say which crew id you mean.")
+        return matches[0]
+
+    def same_pairing(self, a: str, b: str) -> dict[str, Any]:
+        """Whether two crew members are rostered on the same pairing this
+        week, each named by crew id or by name.
+
+        "Is Captain X paired with First Officer Y" is two lookups and a
+        comparison, not one -- both people have to be resolved to a crew id
+        and both pairing assignments fetched before the question is even
+        answerable, and splitting that across separate `lookup` calls is
+        exactly where a partial answer ("no data on X") comes from. This
+        does the whole thing in one call and returns the comparison
+        directly, the same way `check_legality` returns a verdict rather
+        than leaving the model to add up rule results itself.
+        """
+        crew_a, crew_b = self._resolve_person(a), self._resolve_person(b)
+
+        def _pairing(crew: dict[str, Any]) -> str | None:
+            try:
+                pairing_id, role = self.assignment_for_crew(crew["crew_id"])
+            except ToolError:
+                return None
+            crew["role"] = role
+            return pairing_id
+
+        pairing_a, pairing_b = _pairing(crew_a), _pairing(crew_b)
+        return {
+            "crew_a": {"crew_id": crew_a["crew_id"], "name": crew_a["name"],
+                       "rank": crew_a["rank"], "pairing_id": pairing_a,
+                       "role_on_pairing": crew_a.get("role")},
+            "crew_b": {"crew_id": crew_b["crew_id"], "name": crew_b["name"],
+                       "rank": crew_b["rank"], "pairing_id": pairing_b,
+                       "role_on_pairing": crew_b.get("role")},
+            "same_pairing": pairing_a is not None and pairing_a == pairing_b,
         }
 
     # -- Tool 5: find_options ---------------------------------------------
@@ -621,14 +859,20 @@ class JsonToolPort:
 
         # Cross-disruption contention: register this disruption's current
         # candidate pool, then ask what else already open also wants them.
-        # A no-op when LEDGER_DATABASE_URL isn't set (see core_engine/ledger.py).
+        # A no-op when LEDGER_DATABASE_URL isn't set (see core_engine/ledger.py),
+        # and equally a no-op when there's no real disruption_id -- a plain
+        # chat question ("who could cover P-2291?") is an inquiry, not a
+        # controller opening a disruption, and registering it anyway would
+        # create a phantom disruption keyed by the bare pairing_id that then
+        # "contends" with the real one for the exact same crew, purely
+        # because both track the same pairing under two different ids.
         from core_engine import ledger
 
         disruption_key = disruption_id or pairing_id
         contention: dict[str, list[dict[str, Any]]] = {}
-        if ledger.enabled():
+        if ledger.enabled() and disruption_id:
             contention = ledger.register_and_check_contention(
-                disruption_id=disruption_key, pairing_id=pairing_id, role=role,
+                disruption_id=disruption_id, pairing_id=pairing_id, role=role,
                 event_type=event_type,
                 narrative=narrative or f"{role} needed for {pairing_id}",
                 opened_by=opened_by or "unknown",
@@ -746,7 +990,7 @@ class JsonToolPort:
         world = self.world
         checked: list[dict[str, Any]] = []
         for a in assignments:
-            crew_id, pairing_id, role = a["crew_id"], a["pairing_id"], a["role"]
+            crew_id, pairing_id = a["crew_id"], a["pairing_id"]
             self.require("crew", crew_id)
             self.require("pairing", pairing_id)
             this_dates = {d.date for d in world.duty_days(pairing_id)}
@@ -796,17 +1040,115 @@ class JsonToolPort:
     # -- Tool 6: ripple -----------------------------------------------------
 
     def ripple(self, event: dict[str, Any]) -> dict[str, Any]:
-        pairing_id = (event or {}).get("pairing_id")
+        """Blast radius of a disruption, named however the controller
+        actually named it -- a pairing or crew id directly, a flight
+        (id, or number+date, resolved the same way `check_legality`/
+        `find_options` already do), or a station closure window, which
+        can touch several pairings at once and returns their combined
+        blast radius rather than requiring one `ripple` call per pairing.
+        Resolving these here, instead of requiring the caller to already
+        have chased flight -> pairing (or station -> every affected
+        pairing) through separate `lookup` calls first, is exactly the
+        pattern `check_legality`'s own `flight_no`+`date` handling already
+        uses -- the model naming what the controller said, not the id it
+        implies.
+        """
+        event = event or {}
+        pairing_id = event.get("pairing_id")
         if pairing_id:
             self.require("pairing", pairing_id)
-        if not pairing_id and (cid := (event or {}).get("crew_id")):
+            return self._ripple_one(pairing_id)
+
+        if cid := event.get("crew_id"):
             self.require("crew", cid)
             pairing_id = next(
                 (p for p, members in self.world.pairing_crew.items()
                  if any(c == cid for c, _ in members)), None)
-        if not pairing_id:
-            raise ToolError("UNRESOLVED_ENTITY", "ripple needs a pairing_id or crew_id")
+            if pairing_id:
+                return self._ripple_one(pairing_id)
+            raise ToolError("UNRESOLVED_ENTITY",
+                            f"{cid} is not rostered on any pairing this week")
 
+        if event.get("flight_id") or event.get("flight_no"):
+            flight_id = self.resolve_flight(
+                event.get("flight_id"), event.get("flight_no"), event.get("date"))
+            return self._ripple_one(self.pairing_for_flight(flight_id))
+
+        station = event.get("station")
+        if station and (event.get("from_utc") or event.get("to_utc")):
+            from_utc = event.get("from_utc") or "0000-00-00"
+            to_utc = event.get("to_utc") or "9999-99-99"
+            affected_pairings: dict[str, None] = {}  # ordered set
+            for f in self._rows("flights"):
+                if station not in (f.get("dep_station"), f.get("arr_station")):
+                    continue
+                instant = f.get("dep_utc") if f.get("dep_station") == station else f.get("arr_utc")
+                if not (from_utc <= str(instant) <= to_utc):
+                    continue
+                try:
+                    affected_pairings[self.pairing_for_flight(f["flight_id"])] = None
+                except ToolError:
+                    continue
+            extra = {"station": station, "from_utc": event.get("from_utc"),
+                     "to_utc": event.get("to_utc")}
+            return self._ripple_many(affected_pairings, extra)
+
+        aircraft = event.get("aircraft") or event.get("tail_id")
+        if aircraft:
+            date = event.get("date")
+            from_utc = event.get("from_utc") or "0000-00-00"
+            to_utc = event.get("to_utc") or "9999-99-99"
+            affected_pairings = {}
+            for f in self._rows("flights"):
+                if f.get("aircraft") != aircraft:
+                    continue
+                if date and f.get("date") != date:
+                    continue
+                if not (from_utc <= str(f.get("dep_utc")) <= to_utc):
+                    continue
+                try:
+                    affected_pairings[self.pairing_for_flight(f["flight_id"])] = None
+                except ToolError:
+                    continue
+            extra = {"aircraft": aircraft, "date": date,
+                     "from_utc": event.get("from_utc"), "to_utc": event.get("to_utc")}
+            return self._ripple_many(affected_pairings, extra)
+
+        raise ToolError(
+            "UNRESOLVED_ENTITY",
+            "ripple needs a pairing_id, crew_id, flight (id, or number+date), "
+            "an aircraft (optionally with a date or from_utc/to_utc window), "
+            "or a station with a from_utc/to_utc window")
+
+    def _ripple_many(self, affected_pairings: dict[str, None],
+                      extra: dict[str, Any]) -> dict[str, Any]:
+        """Aggregate `_ripple_one` across every pairing an event touches."""
+        if not affected_pairings:
+            return {**extra, "affected_pairings": [],
+                    "uncovered_flights": [], "at_risk_flights": [], "passengers": 0,
+                    "blast_radius": {"nodes": 0, "flights": 0, "aircraft": 0,
+                                     "passengers": 0, "edges": []}}
+        per_pairing = [self._ripple_one(p) for p in affected_pairings]
+        return {
+            **extra,
+            "affected_pairings": list(affected_pairings),
+            "uncovered_flights": [f for r in per_pairing for f in r["uncovered_flights"]],
+            "at_risk_flights": [f for r in per_pairing for f in r["at_risk_flights"]],
+            "passengers": sum(r["passengers"] for r in per_pairing),
+            "blast_radius": {
+                "nodes": sum(r["blast_radius"]["nodes"] for r in per_pairing),
+                "flights": sum(r["blast_radius"]["flights"] for r in per_pairing),
+                "aircraft": len(per_pairing),
+                "passengers": sum(r["blast_radius"]["passengers"] for r in per_pairing),
+                "edges": [e for r in per_pairing for e in r["blast_radius"]["edges"]],
+            },
+        }
+
+    def _ripple_one(self, pairing_id: str) -> dict[str, Any]:
+        """The blast radius of losing crew on a single pairing -- the
+        original, single-pairing shape of this tool, factored out so a
+        station closure (below) can compute it once per affected pairing
+        and combine the results, instead of only ever answering for one."""
         world = self.world
         days = world.duty_days(pairing_id)
         by_day: dict[Any, list[dict]] = {}
@@ -889,6 +1231,12 @@ class JsonToolPort:
         pairing_id = (event or {}).get("pairing_id")
         if not pairing_id:
             raise ToolError("UNRESOLVED_ENTITY", "simulate needs a pairing_id")
+        # A pairing_id that doesn't exist must fail loudly, not fall through
+        # to `world.pairing_crew.get(pairing_id, ())` -- that silently
+        # returns an empty crew list, which produces the exact same
+        # `changed: []` "nothing breaks" result as a REAL pairing that
+        # genuinely has no impact. Those two cases must never look the same.
+        self.require("pairing", pairing_id)
 
         world = self.world
         changed = []

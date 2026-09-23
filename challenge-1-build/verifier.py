@@ -98,6 +98,13 @@ ID_PATTERNS = (
     DATE_RE, CLOCK_RE,
 )
 
+# A name stated immediately before the id it belongs to -- "A. Nair
+# (C-1042)" -- in the `Initial. Surname` shape every one of this dataset's
+# 150 crew names actually has (verified: zero exceptions). This is the one
+# place a name becomes a checkable claim rather than free prose: the id
+# next to it is exactly what evidence.names_by_id below is keyed on.
+NAME_ID_RE = re.compile(r"([A-Z]\.\s?[A-Z][a-zA-Z'-]+)\s*\((C-\d{4})\)")
+
 # A date written the way a controller writes it. `DATE_RE` above catches the
 # ISO form the tools return, but the model answers "on 15 Sep" — and the bare
 # `15` then reads as an unsourced quantity, because no tool output contains
@@ -250,6 +257,11 @@ class Evidence:
     """rule_id -> every status ("PASS"/"FAIL") a verdict for it actually
     carried anywhere in the trace. Populated only from dicts shaped like a
     `RuleVerdict` (both `rule_id` and `status` present) -- see `_rule_walk`."""
+    names_by_id: dict[str, str] = field(default_factory=dict)
+    """crew_id -> the name a tool actually returned for it. A real id with a
+    name that doesn't match this is exactly as unsourced as an invented id
+    -- the model has no other way to know anyone's name than a tool telling
+    it, the same rule that already applies to every number and id."""
 
     def has_identifier(self, value: str) -> str | None:
         if found := self.identifiers.get(value):
@@ -304,6 +316,22 @@ class Evidence:
         return None
 
 
+def _crew_names(node: Any) -> Iterable[tuple[str, str]]:
+    """Yield (crew_id, name) for every dict anywhere in a nested tool result
+    that carries both -- `lookup(crew)` rows, `check_legality`/`duty_clock`'s
+    own result, `find_options`'s options/excluded entries, `same_pairing`'s
+    crew_a/crew_b, `suggest_crew_ids`/`suggest_crew_names`'s candidates, all
+    already share this shape without any tool needing to change."""
+    if isinstance(node, dict):
+        if isinstance(node.get("crew_id"), str) and isinstance(node.get("name"), str):
+            yield node["crew_id"], node["name"]
+        for value in node.values():
+            yield from _crew_names(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _crew_names(item)
+
+
 def _rule_verdicts(node: Any) -> Iterable[tuple[str, str]]:
     """Yield (rule_id, status) for every dict shaped like a `RuleVerdict`
     anywhere in a nested tool result -- `check_legality`'s and
@@ -330,6 +358,8 @@ def build_evidence(trace: Iterable[TraceEntry]) -> Evidence:
     for entry in trace:
         for rule_id, status in _rule_verdicts(entry.result):
             evidence.rule_statuses.setdefault(rule_id, set()).add(status)
+        for crew_id, name in _crew_names(entry.result):
+            evidence.names_by_id.setdefault(crew_id, name)
 
     for entry in trace:
         # `error` counts as evidence: it is text a tool produced, and an id it
@@ -443,6 +473,40 @@ def _rule_context_violations(narrative: str, evidence: Evidence) -> list[Claim]:
     return violations
 
 
+def _crew_name_violations(narrative: str, evidence: Evidence) -> list[Claim]:
+    """A name stated next to a real crew id that no tool result ever paired
+    with that id -- because it names a different person entirely, or
+    because that id only ever appeared in the trace bare (a `pairing_crew`
+    row has a crew_id and a role, never a name). The id being real and
+    genuinely sourced is not enough: the model has no other way to know
+    anyone's name than a tool telling it, the same rule already enforced
+    for every number and id, just never checked for the one piece of
+    information a controller actually reads first.
+
+    Skips any crew_id that isn't sourced at all -- a fully invented id is
+    already caught by the ordinary "identifier" claim check, so this stays
+    scoped to its own job: a real id under the wrong (or unverified) name.
+    """
+    violations: list[Claim] = []
+    seen: set[str] = set()
+    for name, crew_id in NAME_ID_RE.findall(narrative):
+        if crew_id not in evidence.identifiers:
+            continue
+        if evidence.names_by_id.get(crew_id) == name:
+            continue
+        key = f"{crew_id}:{name}"
+        if key in seen:
+            continue
+        seen.add(key)
+        # Not kind="identifier" for the same reason `_rule_context_violations`
+        # isn't: the main loop would re-derive `supported` from the crew_id
+        # alone (True, it is real) and silently undo this claim.
+        claim = Claim("crew_name", f"{name} ({crew_id})")
+        claim.supported = False
+        violations.append(claim)
+    return violations
+
+
 def verify(narrative: str, trace: Iterable[TraceEntry]) -> VerificationResult:
     """Check a drafted answer against the tools that produced it.
 
@@ -457,6 +521,7 @@ def verify(narrative: str, trace: Iterable[TraceEntry]) -> VerificationResult:
     evidence = build_evidence(trace)
     claims = extract_claims(narrative)
     claims += _rule_context_violations(narrative, evidence)
+    claims += _crew_name_violations(narrative, evidence)
 
     for claim in claims:
         if claim.kind == "identifier":

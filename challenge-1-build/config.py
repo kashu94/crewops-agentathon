@@ -62,6 +62,31 @@ ALL_RULE_IDS = (
 )
 
 # --------------------------------------------------------------------------
+# Controller desks -- shared between `console/server.py` (the demo UI) and
+# `core_engine/port.py`'s `list_controllers`/`controller_issue_counts` tools,
+# so a chat question and the console UI can never disagree about who the
+# three desks are.
+# --------------------------------------------------------------------------
+CONTROLLERS: tuple[dict[str, str], ...] = (
+    {"name": "Ananya Iyer", "desk": "VT-DXA / VT-DXB"},
+    {"name": "Rohit Malhotra", "desk": "VT-DXC / VT-DXD"},
+    {"name": "Divya Rao", "desk": "VT-DXE / VT-DXF"},
+)
+"""Three desks sharing one operation. Ananya and Rohit are the two names the
+reference UI itself used; Divya is added to get to three, drawn from the same
+name pool the crew roster uses, so it doesn't stand out as a name that
+couldn't belong here -- and does not correspond to any crew member: a
+controller is a dispatcher, not a pilot or cabin crew on the roster."""
+
+# Which desk owns each of the vendored dataset's 6 engineered scenarios
+# (`data/scenarios.json`) -- S6's two simultaneous events are split into two
+# ids since each competes for cover independently.
+SCENARIO_DESKS: dict[str, str] = {
+    "S1": "Divya Rao", "S2": "Ananya Iyer", "S3": "Rohit Malhotra",
+    "S4": "Ananya Iyer", "S5": "Rohit Malhotra", "S6A": "Divya Rao", "S6B": "Ananya Iyer",
+}
+
+# --------------------------------------------------------------------------
 # Verifier
 # --------------------------------------------------------------------------
 # Numbers below this are prose ("all 7 rules", "the 2 options") rather than

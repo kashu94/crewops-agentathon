@@ -26,6 +26,10 @@ import config
 # --------------------------------------------------------------------------
 
 CREW_RE = re.compile(r"\bC-\d{4}\b")
+# "C-10", "C-10425" -- the right prefix, but not the dataset's 4-digit shape.
+# The negative lookahead excludes anything CREW_RE already matches, so a
+# real id never shows up in both lists.
+MALFORMED_CREW_RE = re.compile(r"\bC-(?!\d{4}\b)\d+\b")
 PAIRING_RE = re.compile(r"\bP-\d{4}\b")
 FLIGHT_ID_RE = re.compile(r"\bDX\d{3}-\d{4}-\d{2}-\d{2}\b")
 FLIGHT_NO_RE = re.compile(r"\bDX\d{3}\b")
@@ -35,6 +39,7 @@ AC_TYPE_RE = re.compile(r"\b(A320|ATR-?72)\b", re.I)
 STATION_RE = re.compile(r"\b[A-Z]{3}\b")
 ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*Z?\b", re.I)
+_TODAY_RE = re.compile(r"\b(today|right now|currently|as of now)\b", re.I)
 
 # Boarding-gate labels: "<station>-G<n>".
 GATE_RE = re.compile(r"\b([A-Z]{3}-G\d+)\b", re.I)
@@ -77,6 +82,26 @@ _STATION_FALSE_FRIENDS = frozenset(
     {"FDP", "UTC", "AND", "THE", "FOR", "WHO", "NOT", "ALL", "ANY", "CAN", "HOW"}
 )
 
+# A controller says the city, not the IATA code -- this is a fixed, tiny
+# vocabulary (8 stations, their common English names), so a plain alias
+# table is the right tool, not a search of any kind: there is no fuzzy
+# judgment call in "Bangalore means BLR", only a lookup.
+STATION_ALIASES: dict[str, str] = {
+    "bangalore": "BLR", "bengaluru": "BLR",
+    "bombay": "BOM", "mumbai": "BOM",
+    "calcutta": "CCU", "kolkata": "CCU",
+    "cochin": "COK", "kochi": "COK",
+    "delhi": "DEL", "new delhi": "DEL",
+    "goa": "GOI",
+    "hyderabad": "HYD",
+    "chennai": "MAA", "madras": "MAA",
+}
+# Longest alias first ("new delhi" before "delhi") so the regex doesn't
+# match the shorter alias inside the longer one and drop a word.
+CITY_RE = re.compile(
+    r"\b(" + "|".join(sorted(STATION_ALIASES, key=len, reverse=True)) + r")\b", re.I
+)
+
 
 # --------------------------------------------------------------------------
 # Result
@@ -88,6 +113,10 @@ class Entities:
     """Everything the router pulled out of a query, deduplicated, order-stable."""
 
     crew_ids: list[str] = field(default_factory=list)
+    malformed_crew_ids: list[str] = field(default_factory=list)
+    """A crew id shaped like `C-##...` but not the dataset's 4-digit form --
+    never in `crew_ids`, since it never matches `CREW_RE`. Candidates for
+    `suggest_crew_ids`, never for a lookup itself."""
     pairing_ids: list[str] = field(default_factory=list)
     flight_ids: list[str] = field(default_factory=list)
     flight_nos: list[str] = field(default_factory=list)
@@ -176,6 +205,14 @@ def extract_dates(text: str) -> list[str]:
             candidate = _mk_date(int(day), week_start.month, week_start.year)
             if candidate and week_start <= date.fromisoformat(candidate) <= week_end:
                 found.append(candidate)
+
+    if not found and _TODAY_RE.search(text):
+        # The real wall-clock date -- NOT a day inside the dataset's fixed
+        # week. This dataset is a historical/fixed snapshot (see
+        # config.WEEK_START/END), so "today" almost certainly falls outside
+        # it; silently remapping it onto day 1 of that week would hide a
+        # real "there is no data for today" answer behind a fabricated one.
+        found.append(date.today().isoformat())
 
     return _dedupe(found)
 
@@ -288,7 +325,7 @@ def extract(text: str) -> Entities:
         s
         for s in STATION_RE.findall(text)
         if s in config.STATIONS and s not in _STATION_FALSE_FRIENDS
-    ]
+    ] + [STATION_ALIASES[city.lower()] for city in CITY_RE.findall(text)]
 
     roles = [name for name, pat in ROLE_PATTERNS if pat.search(text)]
 
@@ -301,6 +338,7 @@ def extract(text: str) -> Entities:
 
     return Entities(
         crew_ids=_dedupe(CREW_RE.findall(text)),
+        malformed_crew_ids=_dedupe(MALFORMED_CREW_RE.findall(text)),
         pairing_ids=_dedupe(PAIRING_RE.findall(text)),
         flight_ids=_dedupe(flight_ids),
         flight_nos=_dedupe(flight_nos),
@@ -320,13 +358,23 @@ def extract(text: str) -> Entities:
 
 
 # --------------------------------------------------------------------------
+# The one spelling of "every way to say a rank" -- shared by every regex
+# below that needs to recognise one (id-based, name-based, and
+# `core_engine.port.JsonToolPort._resolve_person`'s own prefix check), so a
+# new synonym is added in one place rather than three that can drift apart.
+# "F.O."/"F. O." (dotted/spaced) matters as much as "FO"/"F/O": a name-led
+# question is exactly where a controller writes it out this way.
+RANK_WORD_RE_FRAGMENT = (
+    r"captain|cpt|capt|commander|skipper|first officer|f\.?/?o\.?|"
+    r"co-?pilot|senior cabin crew|scc|purser|cabin crew|flight attendant"
+)
+
 # A rank used to *describe* a named crew member — "FO C-2087", "Captain
 # C-1042" — as opposed to specifying a seat to be filled ("cover as Captain").
 # Only the descriptive form asserts something about that person that the
 # roster can contradict.
 STATED_RANK_RE = re.compile(
-    r"\b(captain|cpt|capt|commander|skipper|first officer|f/?o|co-?pilot|"
-    r"senior cabin crew|scc|purser|cabin crew|flight attendant)\s+(C-\d{4})\b",
+    rf"\b({RANK_WORD_RE_FRAGMENT})\s+(C-\d{{4}})\b",
     re.I,
 )
 
@@ -352,7 +400,77 @@ def stated_ranks(text: str) -> list[tuple[str, str]]:
     """
     out = []
     for word, crew_id in STATED_RANK_RE.findall(text):
-        key = word.lower().replace("/", "").replace(" ", " ").strip()
+        key = word.lower().replace(".", "").replace("/", "").strip()
         if rank := RANK_WORD_TO_RANK.get(key) or RANK_WORD_TO_RANK.get(key.replace("-", "")):
             out.append((crew_id, rank))
+    return out
+
+
+# Same idea as `STATED_RANK_RE`, but the descriptive form names a person by
+# name rather than by id ("F.O. A. Nair") -- just as unrecoverable to answer
+# under the wrong rank, so it needs the same roster check. The rank half is
+# matched case-insensitively (`(?i:...)`) while the name half stays
+# case-sensitive -- letting the whole pattern ignore case would make the
+# name half start matching ordinary lowercase words too.
+STATED_RANK_NAME_RE = re.compile(
+    rf"\b((?i:{RANK_WORD_RE_FRAGMENT}))\s+"
+    r"([A-Z]\.\s*[A-Z][a-z]{2,}|[A-Z][a-z]{2,})\b",
+)
+
+
+def stated_rank_names(text: str) -> list[tuple[str, str]]:
+    """(name, rank the query claims they hold), for a name rather than an id.
+
+    >>> stated_rank_names("Is F.O. A. Nair legal to cover P-2291?")
+    [('A. Nair', 'First Officer')]
+    """
+    out = []
+    for word, name in STATED_RANK_NAME_RE.findall(text):
+        key = word.lower().replace(".", "").replace("/", "").strip()
+        if rank := RANK_WORD_TO_RANK.get(key) or RANK_WORD_TO_RANK.get(key.replace("-", "")):
+            out.append((re.sub(r"\.\s+", ". ", name.strip()), rank))
+    return out
+
+
+# A base or a rating stated ahead of *or* after a crew id -- "DEL-based
+# captain C-1042" and "C-3316 is A320-rated" are both descriptive claims
+# the roster can contradict, the exact same category as a stated rank, just
+# a different attribute. Bounded to a short window either side so it can't
+# accidentally pair a station or aircraft type mentioned elsewhere in a long
+# question with an unrelated crew id.
+_BASE_BEFORE_ID_RE = re.compile(r"\b([A-Z]{3})-based\b[^.?!]{0,40}?\b(C-\d{4})\b", re.I)
+_ID_BEFORE_BASE_RE = re.compile(
+    r"\b(C-\d{4})\b[^.?!]{0,40}?\bbased\s+(?:at|in|out of)\s+([A-Z]{3})\b", re.I)
+_RATING_BEFORE_ID_RE = re.compile(r"\b(A320|ATR-?72)-rated\b[^.?!]{0,40}?\b(C-\d{4})\b", re.I)
+_ID_BEFORE_RATING_RE = re.compile(
+    r"\b(C-\d{4})\b[^.?!]{0,40}?\bis\s+(A320|ATR-?72)-rated\b", re.I)
+
+
+def stated_bases(text: str) -> list[tuple[str, str]]:
+    """(crew_id, station the query claims they're based at).
+
+    >>> stated_bases("Get me the DEL-based captain C-1042's positioning options.")
+    [('C-1042', 'DEL')]
+    """
+    out = []
+    for station, crew_id in _BASE_BEFORE_ID_RE.findall(text):
+        if station.upper() in config.STATIONS:
+            out.append((crew_id, station.upper()))
+    for crew_id, station in _ID_BEFORE_BASE_RE.findall(text):
+        if station.upper() in config.STATIONS:
+            out.append((crew_id, station.upper()))
+    return out
+
+
+def stated_ratings(text: str) -> list[tuple[str, str]]:
+    """(crew_id, aircraft type the query claims they're rated on).
+
+    >>> stated_ratings("C-3316 is A320-rated -- can they take the VT-DXD line?")
+    [('C-3316', 'A320')]
+    """
+    out = []
+    for rating, crew_id in _RATING_BEFORE_ID_RE.findall(text):
+        out.append((crew_id, rating.upper().replace("-", "")))
+    for crew_id, rating in _ID_BEFORE_RATING_RE.findall(text):
+        out.append((crew_id, rating.upper().replace("-", "")))
     return out

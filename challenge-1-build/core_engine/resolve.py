@@ -122,6 +122,36 @@ def _digit_variants(value: str) -> set[str]:
     return out
 
 
+def _digit_prefix_matches(query: str, ids: list[str], limit: int) -> list[str]:
+    """Real ids sharing the longest run of leading digits with `query` --
+    the right fallback for a *wrong-length* id ("C-10" for a dataset of
+    C-#### ids), where `difflib.get_close_matches`'s whole-string ratio
+    penalises the length mismatch itself and returns nothing useful:
+    "C-10" and "C-1042" only share 2 of 6 characters by ratio, but a
+    controller who typed "C-10" almost always meant a real id that starts
+    the same way, not just one that merely differs the least. The one
+    strategy behind both `require()`'s "did you mean" and the
+    `suggest_crew_ids` tool -- shared here rather than kept as two
+    implementations that could quietly drift into disagreeing.
+    """
+    digits = "".join(ch for ch in query if ch.isdigit())
+    if not digits:
+        return []
+
+    def shared_prefix_len(candidate: str) -> int:
+        candidate_digits = "".join(ch for ch in candidate if ch.isdigit())
+        n = 0
+        for a, b in zip(digits, candidate_digits):
+            if a != b:
+                break
+            n += 1
+        return n
+
+    ranked = sorted((c for c in ids if shared_prefix_len(c) > 0),
+                    key=lambda c: (-shared_prefix_len(c), c))
+    return ranked[:limit]
+
+
 def resolve(
     kind: str,
     query: str,
@@ -153,7 +183,20 @@ def resolve(
     for candidate in sorted(_transpositions(query) | _digit_variants(query)):
         offer(candidate, TRANSPOSE_CONFIDENCE)
 
-    # Then general nearness, for a wrong digit or a missing character.
+    # A wrong-LENGTH id ("C-10" against 6-character real ids) goes before
+    # the general fallback below, not after: `difflib`'s whole-string ratio
+    # is length-sensitive and returns *something* for almost any input
+    # (never empty, just weak), so a `len(suggestions) < N` check to decide
+    # whether digit-prefix matching is even needed would never fire --
+    # difflib always fills the quota first, with its worse guesses.
+    if not any(len(query) == len(i) for i in ids):
+        for candidate in _digit_prefix_matches(query, ids, MAX_SUGGESTIONS):
+            offer(candidate, CLOSE_CONFIDENCE)
+
+    # Then general nearness, for a wrong digit or a missing character --
+    # `offer()` already skips anything the digit-prefix pass above found,
+    # and the final `[:MAX_SUGGESTIONS]` slice below keeps those earlier,
+    # more relevant candidates over whatever this adds past the cap.
     for candidate in difflib.get_close_matches(query, ids, n=MAX_SUGGESTIONS,
                                                cutoff=0.8):
         offer(candidate, CLOSE_CONFIDENCE)

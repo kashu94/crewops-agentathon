@@ -17,12 +17,22 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import traceback
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+# Matched against the whole (punctuation-stripped) query, not a substring --
+# "hi" answers this; "hi, is C-1042 on reserve" does not, and falls through
+# to the real pipeline as it should.
+_GREETING_RE = re.compile(
+    r"(hi+|hey+|hello+|yo|sup|howdy|good (morning|afternoon|evening)|"
+    r"thanks?( you)?|thank you|ty|cheers)",
+    re.IGNORECASE,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = REPO_ROOT / "challenge-1-build"
@@ -32,6 +42,7 @@ from dotenv import load_dotenv
 
 load_dotenv(REPO_ROOT / ".env")
 
+import config
 import pii
 import pipeline
 import router
@@ -42,18 +53,31 @@ from explainer import render as render_narrative
 from schemas import AdvisorResponse
 from tools import ToolError, dispatch
 
+# `agents.py` imports `azure-ai-projects`/`azure-identity`/`openai` at module
+# level -- packages this console has never required before, since everything
+# else here is deterministic. A plain top-level import would crash this
+# entire console on startup for anyone who hasn't installed the full
+# repo-root `requirements.txt` (a bare venv for just the deterministic
+# console, say), even though they'd never touch the Advisor Agent fallback.
+# Caught here, once, so the rest of the console works exactly as before
+# either way; `_init_advisor_agents()` below is what actually decides
+# whether the fallback is live.
+try:
+    from agents import (
+        PROJECT_CONNECTION_STRING, ExplainerAgent, ResolutionAdvisorAgent,
+        TriageAgent, answer_question,
+    )
+except ImportError:
+    PROJECT_CONNECTION_STRING = None
+    ExplainerAgent = ResolutionAdvisorAgent = TriageAgent = answer_question = None
+
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = 8600
 
-CONTROLLERS: list[dict[str, str]] = [
-    {"name": "Ananya Iyer", "desk": "VT-DXA / VT-DXB"},
-    {"name": "Rohit Malhotra", "desk": "VT-DXC / VT-DXD"},
-    {"name": "Divya Rao", "desk": "VT-DXE / VT-DXF"},
-]
-"""Three desks sharing one operation. Ananya and Rohit are the two names the
-reference UI itself used; Divya is added to get to three, drawn from the
-same name pool `crew-ops-advisor-dataset/generate.py` uses for the rest of
-the roster, so it doesn't stand out as a name that couldn't belong here."""
+CONTROLLERS = config.CONTROLLERS
+"""Single-sourced from `config.py` so a chat question answered by
+`core_engine.port.JsonToolPort.list_controllers()` can never disagree with
+what this console's own UI shows."""
 
 # The vendored dataset's own scenario set is the disruption catalog -- no
 # fabricated disruptions, everything here is one of `data/scenarios.json`'s
@@ -61,20 +85,22 @@ the roster, so it doesn't stand out as a name that couldn't belong here."""
 # disruption records, since each competes for cover independently).
 DISRUPTIONS: list[dict[str, object]] = [
     {"id": "S1", "title": "ATR captain sick call", "event_type": "SICK_CREW",
-     "crew_id": "C-3231", "pairing_id": "P-2224", "desk": "Divya Rao"},
+     "crew_id": "C-3231", "pairing_id": "P-2224"},
     {"id": "S2", "title": "Flagship: Captain C-1042 sick, 2-day pairing", "event_type": "SICK_CREW",
-     "crew_id": "C-1042", "pairing_id": "P-2291", "desk": "Ananya Iyer"},
+     "crew_id": "C-1042", "pairing_id": "P-2291"},
     {"id": "S3", "title": "BLR station closure 08:00-14:00Z, 17 Sep", "event_type": "STATION_CLOSURE",
-     "crew_id": None, "pairing_id": None, "desk": "Rohit Malhotra"},
+     "crew_id": None, "pairing_id": None},
     {"id": "S4", "title": "Tech delay cascades into an FDP breach", "event_type": "DELAY",
-     "crew_id": None, "pairing_id": None, "desk": "Ananya Iyer"},
+     "crew_id": None, "pairing_id": None},
     {"id": "S5", "title": "Certification lapse discovered pre-flight", "event_type": "CERT_EXPIRY",
-     "crew_id": "C-5417", "pairing_id": "P-2213", "desk": "Rohit Malhotra"},
+     "crew_id": "C-5417", "pairing_id": "P-2213"},
     {"id": "S6A", "title": "Two simultaneous sick calls -- VT-DXA captain", "event_type": "MULTI_SICK",
-     "crew_id": "C-3940", "pairing_id": "P-2205", "desk": "Divya Rao"},
+     "crew_id": "C-3940", "pairing_id": "P-2205"},
     {"id": "S6B", "title": "Two simultaneous sick calls -- VT-DXB captain", "event_type": "MULTI_SICK",
-     "crew_id": "C-1938", "pairing_id": "P-2212", "desk": "Ananya Iyer"},
+     "crew_id": "C-1938", "pairing_id": "P-2212"},
 ]
+for _d in DISRUPTIONS:
+    _d["desk"] = config.SCENARIO_DESKS[_d["id"]]
 
 _NARRATIVES = {sc["scenario_id"]: sc for sc in json.loads((BUILD_DIR / "data" / "scenarios.json").read_text())}
 _NARRATIVES["S6A"] = _NARRATIVES["S6B"] = _NARRATIVES["S6"]
@@ -85,6 +111,43 @@ for _d in DISRUPTIONS:
         (e.get("narrative", "") for e in _event.get("events", [])), "")
 
 PORT_INSTANCE = JsonToolPort()
+
+# Set once by `_init_advisor_agents()` at server startup, and only if
+# PROJECT_CONNECTION_STRING is configured -- stay None otherwise, so `_ask()`
+# keeps giving its honest "needs the Advisor Agent" decline instead of
+# crashing when this console is run with no Azure Foundry deployment.
+_TRIAGE_AGENT: TriageAgent | None = None
+_ADVISOR_AGENT: ResolutionAdvisorAgent | None = None
+_EXPLAINER_AGENT: ExplainerAgent | None = None
+
+
+def _init_advisor_agents() -> None:
+    """Create the three Foundry agents once, at server startup, not per
+    request -- agent creation is a network round trip to Foundry, and the
+    whole point of doing this here is that a controller's first unclassified
+    question doesn't pay for it. Failure here (no deployment, bad
+    credentials, Foundry unreachable) is caught and logged, not raised: this
+    console must keep serving the deterministic pipeline either way."""
+    global _TRIAGE_AGENT, _ADVISOR_AGENT, _EXPLAINER_AGENT
+    if not PROJECT_CONNECTION_STRING:
+        print("PROJECT_CONNECTION_STRING not set -- chat falls back to "
+              "deterministic-only for unclassified questions.")
+        return
+    try:
+        triage = TriageAgent()
+        triage.create()
+        advisor = ResolutionAdvisorAgent(PORT_INSTANCE)
+        advisor.create()
+        explainer_agent = ExplainerAgent()
+        explainer_agent.create()
+    except Exception:
+        print("Advisor Agent setup failed -- chat falls back to deterministic-only:")
+        traceback.print_exc()
+        return
+    _TRIAGE_AGENT, _ADVISOR_AGENT, _EXPLAINER_AGENT = triage, advisor, explainer_agent
+    print(f"Advisor Agent ready: {advisor.agent.name} (+ Triage, Explainer) "
+          f"-- unclassified chat questions now get real model reasoning.")
+
 
 _GATES_BY_PAIRING: dict[str, list[dict[str, object]]] = {}
 for _g in json.loads((BUILD_DIR / "data" / "boarding_gates.json").read_text()):
@@ -400,25 +463,62 @@ class Handler(BaseHTTPRequestHandler):
         return ledger.recent_decisions()
 
     def _ask(self, query: str) -> dict[str, object]:
-        """A controller's plain-English question, answered by the same
-        router -> tools -> verifier pipeline `challenge-1-build/agents.py`
-        runs -- minus the Triage/Explainer Agents themselves, since those
-        need a live Azure Foundry deployment this console doesn't have.
+        """A controller's plain-English question.
 
-        `router.py`'s own regression suite shows its ~20 deterministic rules
-        settle every one of this dataset's 38 gold questions without a
-        model call at all, so this covers the large majority of real
-        questions honestly, not as a stand-in for the LLM path. What it
-        cannot do -- SIMULATE_WHATIF, RESOLVE_ILLEGAL, and anything the
-        router itself can't classify -- says so plainly instead of guessing,
-        the same discipline `pipeline.explain_no_tools()` already applies.
+        `router.py`'s ~20 deterministic rules settle every one of this
+        dataset's 38 gold questions without a model call at all, so that
+        path covers the large majority of real questions with zero LLM
+        involvement -- not a stand-in for one. The one gap is a question the
+        router genuinely can't classify (SIMULATE_WHATIF, RESOLVE_ILLEGAL,
+        or free-form phrasing like "hey"): if `_init_advisor_agents()`
+        managed to stand up a live Foundry connection at startup, that gap
+        is handed off to the real `agents.py` pipeline instead of guessed
+        at; if not, it says so plainly, the same discipline
+        `pipeline.explain_no_tools()` already applies to its own gaps.
         """
         query = (query or "").strip()
         if not query:
             return {"query": query, "narrative": "Ask a question about a crew member, "
                     "pairing, flight, or rule -- e.g. \"Is C-2087 legal to cover P-2291?\""}
 
-        route = router.route(query)  # no triage_fn: deterministic rules only
+        # A plain greeting is not a crew-ops question, and answering it with
+        # a model call risks it reaching for one of the fixed intent labels
+        # anyway (see the EXPLAIN_RULE misfire this replaced) -- a fixed
+        # template costs nothing and can't hallucinate, unlike a model that
+        # has no "just say hi back" option in its own instructions.
+        if _GREETING_RE.fullmatch(query.strip(" !.?")):
+            return {
+                "query": query, "classified": False, "intent": None, "tier": None,
+                "narrative": (
+                    "Hi -- ask me about a crew member, pairing, flight, or rule, "
+                    "e.g. \"Is C-2087 legal to cover P-2291?\" or \"Who is on "
+                    "reserve at BLR?\""
+                ),
+                "verified": None, "tool_calls": [],
+            }
+
+        if mismatch := pipeline.stated_attribute_mismatch(query, PORT_INSTANCE):
+            # Same pre-flight safety guard `agents.py`'s CLI path already
+            # runs -- a stated rank the roster contradicts is a wrong-person
+            # risk, so this has to stop the question here rather than let
+            # either the deterministic fast path or the Advisor Agent answer
+            # around a false premise.
+            route = router.route(query)
+            return {
+                "query": query,
+                "classified": route.matched_rule is not None,
+                "intent": str(route.intent) if route.matched_rule is not None else None,
+                "tier": int(route.tier) if route.matched_rule is not None else None,
+                "narrative": pii.redact_pii_text(mismatch),
+                "verified": None,
+                "tool_calls": [],
+            }
+
+        # No triage_fn: deterministic rules, then the semantic hybrid-search
+        # fallback inside route() itself -- both run here; only the LLM
+        # Triage Agent is excluded from this call (see the answer_question()
+        # handoff below for where that still happens).
+        route = router.route(query)
         trace, seen = [], set()
 
         def run_calls(calls):
@@ -431,7 +531,7 @@ class Handler(BaseHTTPRequestHandler):
 
         classified = route.matched_rule is not None
         if classified:
-            run_calls(pipeline.seed_calls(route))
+            run_calls(pipeline.seed_calls(route, query))
             run_calls(pipeline.followup_calls(route, trace))
 
         verified = None
@@ -443,15 +543,39 @@ class Handler(BaseHTTPRequestHandler):
             )
             narrative = render_narrative(response)
             verified = verifier.verify(narrative, trace).ok
+        elif _ADVISOR_AGENT is not None:
+            # Empty trace, whether or not the router matched a rule -- a
+            # matched rule with nothing for seed_calls()/followup_calls() to
+            # act on is exactly as unresolved as no match at all, and only
+            # the Advisor Agent's own tool-calling loop (Triage -> tool loop
+            # -> render -> Explainer -> verify), the same one `python
+            # agents.py` runs, can actually reason its way to an answer
+            # instead of declining on partial signal.
+            agent_response = answer_question(
+                query, PORT_INSTANCE, _TRIAGE_AGENT, _ADVISOR_AGENT, _EXPLAINER_AGENT)
+            discarded = any("discarded" in u for u in agent_response.unknowns)
+            return {
+                "query": query,
+                "classified": True,
+                "intent": str(agent_response.intent),
+                "tier": int(agent_response.tier),
+                "narrative": pii.redact_pii_text(agent_response.narrative),
+                "verified": not discarded,
+                "tool_calls": [
+                    {"tool": t.tool, "args": t.args, "error": t.error}
+                    for t in agent_response.trace
+                ],
+                "via_advisor_agent": True,
+            }
         elif classified:
             narrative = pipeline.explain_no_tools(route)
         else:
             narrative = (
-                "This doesn't match any of the router's deterministic rules, so it "
-                "genuinely needs the Resolution Advisor Agent's own judgment -- which "
-                "needs a live Azure Foundry deployment (challenge-0-setup) this console "
-                "doesn't have. Try rephrasing with an explicit crew id (C-1042), pairing "
-                "(P-2291), or rule (RULE-DUTY-02)."
+                "This doesn't match any of the router's deterministic rules, and "
+                "the Advisor Agent isn't configured for this console right now -- "
+                "so it genuinely can't answer yet rather than guessing. Try "
+                "rephrasing with an explicit crew id (C-1042), pairing (P-2291), "
+                "or rule (RULE-DUTY-02)."
             )
 
         return {
@@ -578,6 +702,7 @@ def main() -> None:
     print(f"Ledger enabled: {ledger.enabled()}")
     if ledger.enabled():
         _warm_ledger()
+    _init_advisor_agents()
     print(f"Serving on http://localhost:{PORT}")
     print("Open in 3 tabs with ?controller=Ananya+Iyer / Rohit+Malhotra / Divya+Rao")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

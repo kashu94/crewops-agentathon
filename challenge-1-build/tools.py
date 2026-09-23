@@ -5,8 +5,8 @@ Resolution Advisor Agent above it may only *choose* tools and *narrate* what
 they return. It never computes a duty hour or a cost itself.
 
 Tools are coarse and semantically meaningful rather than micro-CRUD, so a
-tier-2 question is three calls rather than thirty. There are ten of them —
-`TOOL_SCHEMAS` below is the exact list, in vendor-neutral JSON Schema.
+tier-2 question is three calls rather than thirty. There are fifteen of
+them — `TOOL_SCHEMAS` below is the exact list, in vendor-neutral JSON Schema.
 `foundry_tools()` adapts that list into `azure.ai.projects.models.FunctionTool`
 objects for `PromptAgentDefinition(tools=...)`.
 
@@ -182,7 +182,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Blast radius of a disruption: directly uncovered flights, orphaned "
             "downstream pairing days, passengers affected, reserve pool "
-            "depletion, aircraft rotation knock-on."
+            "depletion, aircraft rotation knock-on. Name the disruption however "
+            "the controller actually said it -- this resolves it for you: "
+            "pairing_id or crew_id directly; flight_id, or flight_no+date "
+            "('what if we cancel DX404 on 16 Sep'); station+from_utc/to_utc "
+            "for a closure window ('BLR shuts 08:00-14:00Z on 17 Sep'); or "
+            "aircraft (tail id), optionally with a date or from_utc/to_utc "
+            "window ('if VT-DXC goes tech on 16 Sep' -- date scopes it to "
+            "that day; omit both for the whole week, e.g. 'the whole VT-DXE "
+            "line is grounded for the week'). station and aircraft both cover "
+            "every pairing that touches them in that window and combine their "
+            "blast radius, not just one."
         ),
         "input_schema": {
             "type": "object",
@@ -191,7 +201,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "object",
                     "description": (
                         "e.g. {'type':'SICK_CREW','crew_id':'C-1042',"
-                        "'pairing_id':'P-2291','reported_utc':'...'}"
+                        "'pairing_id':'P-2291'}, or {'type':'TECH_DELAY',"
+                        "'flight_no':'DX404','date':'2026-09-16'}, or "
+                        "{'type':'STATION_CLOSURE','station':'BLR',"
+                        "'from_utc':'2026-09-17T08:00:00Z','to_utc':"
+                        "'2026-09-17T14:00:00Z'}, or {'type':'TECH_EVENT',"
+                        "'aircraft':'VT-DXC','date':'2026-09-16'}, or "
+                        "{'type':'AOG','aircraft':'VT-DXE'} for the whole "
+                        "week. Pass whichever of these you actually have -- "
+                        "never a placeholder id."
                     ),
                 }
             },
@@ -202,7 +220,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "simulate",
         "description": (
             "Fork the world, apply a perturbation, re-evaluate, and return the "
-            "diff. Handles SICK_CREW, STATION_CLOSURE, TECH_DELAY, CERT_LAPSE."
+            "diff. Handles SICK_CREW, STATION_CLOSURE, TECH_DELAY, CERT_LAPSE. "
+            "event.pairing_id must be a real pairing id -- if the question "
+            "named a flight or aircraft instead, resolve it with `lookup` "
+            "first (flight -> its pairing, or aircraft + date -> pairing). "
+            "Never put a placeholder in event."
         ),
         "input_schema": {
             "type": "object",
@@ -215,7 +237,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Cost-minimal assignment across several simultaneous disruptions, "
             "under the constraint that one crew member cannot cover two "
-            "pairings. Note that ties are common and all are equally correct."
+            "pairings. Note that ties are common and all are equally correct. "
+            "Every event needs a real pairing_id -- 'both A320 captains "
+            "(VT-DXA and VT-DXB) are sick' names aircraft, not pairings, so "
+            "resolve each one with `lookup` (e.g. entity=pairings, "
+            "filters={'aircraft': 'VT-DXA'}, plus the date) before calling "
+            "this. Never put a placeholder in events."
         ),
         "input_schema": {
             "type": "object",
@@ -223,6 +250,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "events": {"type": "array", "items": {"type": "object"}},
             },
             "required": ["events"],
+        },
+    },
+    {
+        "name": "same_pairing",
+        "description": (
+            "Whether two crew members are rostered on the same pairing this "
+            "week. Name each one by crew id, or by name -- both are resolved "
+            "and both pairing assignments are compared for you. This is the "
+            "right tool for 'is Captain X paired with First Officer Y' and "
+            "any other question comparing two named crew members' rosters; "
+            "do not try to answer it from two separate `lookup` calls. "
+            "Pass each name exactly as the question stated it, including any "
+            "rank word ('Captain A. Nair', not just 'A. Nair') -- several "
+            "surnames repeat across ranks, and the rank the question already "
+            "gave you is what tells them apart. If it still comes back "
+            "NEEDS_CONFIRMATION, that means the question's own wording "
+            "wasn't enough to disambiguate either -- report the choices "
+            "given, don't guess one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "description": "First crew member: crew id, or '<rank> <name>' / name."},
+                "b": {"type": "string", "description": "Second crew member: crew id, or '<rank> <name>' / name."},
+            },
+            "required": ["a", "b"],
         },
     },
     {
@@ -237,7 +290,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "that gate. Pass delay_minutes to test whether delaying this "
             "flight's departure would collide with whatever is booked into "
             "the same gate afterwards. Returns the actual assignment and "
-            "window, never a bare boolean."
+            "window, never a bare boolean. Called with no flight/gate named, "
+            "returns aggregate counts instead: with no date, the static "
+            "inventory (total boarding gates, how many per station) for "
+            "questions like 'how many boarding gates are there'; with a "
+            "date, how many of those gates actually had a flight boarding "
+            "that day -- a different, usually smaller number than the "
+            "inventory. Pass station (e.g. 'BLR') to scope either aggregate "
+            "to one station instead of all of them."
         ),
         "input_schema": {
             "type": "object",
@@ -250,7 +310,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string", "pattern": "^DX[0-9]{3}$",
                     "description": "Pass `date` alongside it — a flight number alone is ambiguous.",
                 },
-                "date": {"type": "string", "description": "ISO date, with flight_no"},
+                "date": {
+                    "type": "string",
+                    "description": ("ISO date. With flight_no, which day's flight to check. "
+                                     "With no flight/gate at all, which day's occupancy to "
+                                     "count instead of the static gate inventory."),
+                },
+                "station": {
+                    "type": "string",
+                    "description": "e.g. 'BLR' — scope the aggregate counts to one station.",
+                },
                 "boarding_gate_number": {
                     "type": "string",
                     "description": "e.g. 'BLR-G1', as claimed by the controller.",
@@ -277,6 +346,64 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
             "required": ["rule_id"],
         },
+    },
+    {
+        "name": "search_rules",
+        "description": (
+            "Find the rule(s) closest to a paraphrased legality question that "
+            "names no rule id -- e.g. 'can duty run long on a short day'. "
+            "Call explain_rule instead whenever a rule id (RULE-XXX-00) is "
+            "already known; this is only for when one isn't. Each candidate "
+            "carries its own blended_score in [0, 1] (BM25 keyword rank "
+            "blended with semantic similarity) -- below 0.65 the match is "
+            "weak, so say so rather than treating the top result as certain."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The controller's own question, verbatim."},
+                "top_k": {"type": "integer", "description": "How many candidates to return (default 3)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "suggest_crew_ids",
+        "description": (
+            "Real crew ids closest to one that doesn't match the dataset's "
+            "C-#### shape (e.g. 'C-10') -- for offering the controller real "
+            "alternatives to pick from. Deterministic digit-prefix matching "
+            "against the actual roster, not a guess: never treat a "
+            "suggestion as the crew member actually meant, only list them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "near": {"type": "string", "description": "The malformed id as typed, e.g. 'C-10'."},
+                "limit": {"type": "integer", "description": "How many candidates to return (default 3)."},
+            },
+            "required": ["near"],
+        },
+    },
+    {
+        "name": "list_controllers",
+        "description": (
+            "The controller desks working this operation, by name and which "
+            "aircraft each covers. A controller dispatches; none of them are "
+            "crew, so this is never what answers a question about a crew "
+            "member even if a name looks similar."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "controller_issue_counts",
+        "description": (
+            "How many open disruption cases each controller desk currently "
+            "has, from the live ledger. Use this for 'how many issues does "
+            "each controller have' -- do not try to count it from `lookup`, "
+            "which has no notion of a controller or a disruption case."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         # Deliberately NOT in ADVISOR_TOOL_NAMES / foundry_tools()'s default
@@ -317,16 +444,21 @@ ADVISOR_TOOL_NAMES: frozenset[str] = TOOL_NAMES - {"commit_decision"}
 `commit_decision`'s schema comment above for why it's excluded."""
 
 
-def foundry_tools(names: Any = None) -> list[Any]:
-    """`TOOL_SCHEMAS` (or a subset of them) as `azure.ai.projects.models.FunctionTool`.
+def foundry_tools(names: Any = None, schemas: list[dict[str, Any]] | None = None) -> list[Any]:
+    """`TOOL_SCHEMAS` (or `schemas`, or a subset of either by `names`) as
+    `azure.ai.projects.models.FunctionTool`.
 
-    Imports the Azure SDK lazily so this module — and everything that reads
-    `TOOL_SCHEMAS` for its own purposes, like the router's tool narrowing —
-    stays importable without the SDK installed (e.g. under `pytest`).
+    `schemas` lets a caller pass `schemas_for_port(port)`'s enriched list
+    (real column names baked into `lookup`'s own description) instead of the
+    generic one — every tool is still offered to the model regardless; only
+    the wording of `lookup`'s own schema differs. Imports the Azure SDK
+    lazily so this module stays importable without the SDK installed (e.g.
+    under `pytest`).
     """
     from azure.ai.projects.models import FunctionTool
 
-    wanted = TOOL_SCHEMAS if names is None else [t for t in TOOL_SCHEMAS if t["name"] in names]
+    base = schemas if schemas is not None else TOOL_SCHEMAS
+    wanted = base if names is None else [t for t in base if t["name"] in names]
     return [
         FunctionTool(
             name=t["name"],
@@ -457,6 +589,28 @@ def crew_named(port: Any, name: str) -> list[dict[str, Any]]:
     return out
 
 
+def suggest_crew_names(port: Any, name: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Real crew names closest to one that matched nobody -- for a typo
+    ("A. Nayar" for "A. Nair"), the same "suggest, never substitute"
+    discipline `core_engine/resolve.py` already applies to ids. Plain
+    character-level closeness (`difflib`), not BM25: a single misspelled
+    surname is too short for term-frequency ranking to mean anything, and
+    this dataset's 150 names is small enough that a direct closeness scan
+    is instant.
+    """
+    import difflib
+
+    wanted = name.strip().lower()
+    if not wanted:
+        return []
+    rows = port.lookup("crew")
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_name.setdefault(str(row.get("name") or "").lower(), []).append(row)
+    close = difflib.get_close_matches(wanted, by_name, n=limit, cutoff=0.6)
+    return [row for key in close for row in by_name[key]][:limit]
+
+
 def _comparable(value: Any) -> Any:
     """Coerce a value so a row and a filter bound can be ordered together.
 
@@ -522,11 +676,12 @@ def schemas_for_port(port: Any) -> list[dict[str, Any]]:
             continue
         clone = {**tool, "input_schema": {**tool["input_schema"],
                                           "properties": {**tool["input_schema"]["properties"]}}}
+        original = tool["input_schema"]["properties"]["filters"]
         clone["input_schema"]["properties"]["filters"] = {
-            "type": "object",
+            **original,
             "description": (
-                "Field equality filters. Use ONLY these field names — any other "
-                "key is rejected:\n" + "\n".join(lines)
+                original["description"] + "\n\nUse ONLY these field names per "
+                "entity — any other key is rejected:\n" + "\n".join(lines)
             ),
         }
         enriched.append(clone)
@@ -549,6 +704,7 @@ class ToolPort(Protocol):
                        flight_id: str | None = None, flight_no: str | None = None,
                        date: str | None = None,
                        delay_h: float = 0.0) -> dict[str, Any]: ...
+    def same_pairing(self, a: str, b: str) -> dict[str, Any]: ...
     def find_options(self, role: str | None = None, pairing_id: str | None = None,
                      flight_id: str | None = None, crew_id: str | None = None,
                      flight_no: str | None = None, date: str | None = None,
@@ -557,9 +713,14 @@ class ToolPort(Protocol):
     def simulate(self, event: dict[str, Any]) -> dict[str, Any]: ...
     def joint_plan(self, events: list[dict[str, Any]]) -> dict[str, Any]: ...
     def explain_rule(self, rule_id: str) -> dict[str, Any]: ...
+    def search_rules(self, query: str, top_k: int = 3) -> list[dict[str, Any]]: ...
+    def suggest_crew_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]: ...
+    def list_controllers(self) -> list[dict[str, Any]]: ...
+    def controller_issue_counts(self) -> list[dict[str, Any]]: ...
     def check_gate(self, flight_id: str | None = None, flight_no: str | None = None,
                    date: str | None = None, boarding_gate_number: str | None = None,
-                   delay_minutes: float = 0.0, at_utc: str | None = None) -> dict[str, Any]: ...
+                   delay_minutes: float = 0.0, at_utc: str | None = None,
+                   station: str | None = None) -> dict[str, Any]: ...
     def commit_decision(self, disruption_id: str, pairing_id: str, crew_id: str, role: str,
                         committed_by: str, accepted_rank: int | None = None,
                         presented_options: list[dict[str, Any]] | None = None,

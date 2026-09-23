@@ -46,7 +46,7 @@ ROUTER (regex, 0 model calls) ──▶ TRIAGE AGENT (only if the router abstain
 PLANNER — pipeline.py's seed_calls() (0 model calls, pure Python)
         │
         ▼
-RESOLUTION ADVISOR AGENT — the tool loop (1..8 model calls, 10 tools)
+RESOLUTION ADVISOR AGENT — the tool loop (1..8 model calls, 15 tools)
         │
         ▼
 VERIFIER — verifier.py (0 model calls, set-membership over the tool trace)

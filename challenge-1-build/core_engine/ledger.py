@@ -98,13 +98,23 @@ def register_and_check_contention(
     crew_ids = [c["crew_id"] for c in candidates]
 
     with _conn() as conn:
+        # `opened_by` refreshes on every view like the other columns do --
+        # the contention message ("also wanted by X's desk") should name
+        # whoever most recently has eyes on it, not whoever happened to
+        # view it first. The `CASE` guards against the one way that could
+        # regress: server.py's own `"unknown"` fallback for a request with
+        # no `?controller=` (a raw API call, not real UI navigation) must
+        # never overwrite an already-known real name.
         conn.execute(
             """INSERT INTO open_disruptions
                    (disruption_id, pairing_id, role, event_type, narrative, opened_by)
                VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (disruption_id) DO UPDATE SET
                    pairing_id = EXCLUDED.pairing_id, role = EXCLUDED.role,
-                   event_type = EXCLUDED.event_type, narrative = EXCLUDED.narrative""",
+                   event_type = EXCLUDED.event_type, narrative = EXCLUDED.narrative,
+                   opened_by = CASE WHEN EXCLUDED.opened_by = 'unknown'
+                                     THEN open_disruptions.opened_by
+                                     ELSE EXCLUDED.opened_by END""",
             (disruption_id, pairing_id, role, event_type, narrative, opened_by),
         )
         conn.execute(

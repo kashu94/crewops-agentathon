@@ -15,8 +15,9 @@ and tool set dCortex's own team shipped: their docs describe the system as
 classes are.
 
   TriageAgent              no tools   — classifies tier/intent, only called
-                                         when router.py's regex rules abstain
-  ResolutionAdvisorAgent   10 tools   — the tool loop; every number, id and
+                                         when router.py's regex rules AND its
+                                         semantic hybrid-search fallback abstain
+  ResolutionAdvisorAgent   15 tools   — the tool loop; every number, id and
                                          verdict in the final answer comes
                                          from one of its tool calls
   ExplainerAgent           no tools   — rewrites the verified template into
@@ -37,6 +38,7 @@ from dotenv import load_dotenv
 from azure.ai.projects import AIProjectClient
 from azure.ai.projects.models import PromptAgentDefinition
 from azure.identity import DefaultAzureCredential
+import openai
 from openai.types.responses.response_input_param import FunctionCallOutput
 
 
@@ -63,7 +65,7 @@ from core_engine.port import JsonToolPort
 from explainer import polish, render, collect_citations
 from prompts import INTENT_GUIDANCE, base_system_prompt
 from schemas import AdvisorResponse, Confidence, TraceEntry
-from tools import TOOL_SCHEMAS, dispatch, foundry_tools
+from tools import TOOL_SCHEMAS, dispatch, foundry_tools, schemas_for_port
 
 PROJECT_CONNECTION_STRING = os.getenv("PROJECT_CONNECTION_STRING")
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-5.4")
@@ -122,7 +124,7 @@ class TriageAgent:
 
 
 # =============================================================================
-# Resolution Advisor Agent — all 10 real tools, backed by core_engine/
+# Resolution Advisor Agent — all 15 real tools, backed by core_engine/
 # =============================================================================
 
 class ResolutionAdvisorAgent:
@@ -145,7 +147,11 @@ class ResolutionAdvisorAgent:
             definition=PromptAgentDefinition(
                 model=config.ADVISOR_MODEL_DEPLOYMENT_NAME,
                 instructions=base_system_prompt(),
-                tools=foundry_tools(),
+                # The enriched schema puts `lookup`'s real column names
+                # directly in its own description -- guessing a plausible
+                # but wrong one (`departure` for `dep_station`) was the
+                # single biggest source of tier-1 tool failures before this.
+                tools=foundry_tools(schemas=schemas_for_port(self.port)),
             ),
         )
         return self.agent
@@ -168,7 +174,7 @@ class ResolutionAdvisorAgent:
                 seen.add(signature)
                 trace.append(dispatch(self.port, call.name, call.args))
 
-        run_calls(pipeline.seed_calls(route))
+        run_calls(pipeline.seed_calls(route, query_text))
         run_calls(pipeline.followup_calls(route, trace))
 
         # A PromptAgentDefinition's instructions are fixed for the agent
@@ -260,7 +266,15 @@ class ExplainerAgent:
                     "You may NOT add any identifier, number, name or claim "
                     "that is not already present in what you are given — a "
                     "verifier checks this afterwards and discards your "
-                    "answer if you do."
+                    "answer if you do. "
+                    "State what you are given directly and completely — if it "
+                    "already names a recommended assignment, a verdict or a "
+                    "total cost, say that plainly as the answer. Do not hedge "
+                    "it into a maybe, reframe a stated recommendation as a "
+                    "speculative risk, or describe in the future tense ('this "
+                    "will likely require...') something the data already "
+                    "states as decided. Omitting a number that was given to "
+                    "you is exactly as wrong as inventing one that wasn't."
                 ),
             ),
         )
@@ -304,7 +318,7 @@ def answer_question(
     explainer_agent: ExplainerAgent,
 ) -> AdvisorResponse:
     """One controller question, start to finish."""
-    if mismatch := pipeline.rank_mismatch(query, port):
+    if mismatch := pipeline.stated_attribute_mismatch(query, port):
         route = router.route(query, triage.run)
         response = AdvisorResponse(tier=route.tier, intent=route.intent, query=query)
         response.narrative = mismatch
@@ -313,7 +327,28 @@ def answer_question(
         return response
 
     route = router.route(query, triage.run)
-    trace = advisor.run_intent(route, query)
+    try:
+        trace = advisor.run_intent(route, query)
+    except openai.BadRequestError as exc:
+        # Azure's own content-filter layer refusing the request outright
+        # (e.g. a detected prompt-injection attempt) raises here rather
+        # than returning a normal response for the model to decline in its
+        # own words -- caught specifically (not every BadRequestError,
+        # which could also mean a real bug in how a call was built) so a
+        # controller sees a clean, honest decline instead of a raw crash.
+        body = getattr(exc, "body", None) or {}
+        if isinstance(body, dict) and body.get("code") == "content_filter":
+            response = AdvisorResponse(tier=route.tier, intent=route.intent, query=query)
+            response.narrative = (
+                "This question was blocked by the platform's own safety "
+                "filter before it reached the model \u2014 it reads as an "
+                "attempt to override these instructions rather than a "
+                "genuine crew-ops question. Rephrase it as a question "
+                "about a crew member, pairing, flight, or rule."
+            )
+            response.confidence = Confidence.HIGH
+            return response
+        raise
 
     response = AdvisorResponse(
         tier=route.tier,

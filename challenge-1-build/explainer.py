@@ -341,8 +341,28 @@ def render_consequence(answer: ConsequenceAnswer) -> str:
             f"{br.aircraft} aircraft · {br.passengers} passengers"
         )
 
-    if answer.world_diff and (changed := answer.world_diff.get("changed")):
-        lines.append(f"\n{len(changed)} change(s) versus the base world.")
+    if answer.world_diff is not None:
+        # An empty `changed` list is a real, computed finding -- "nothing's
+        # legal status flips under this scenario" -- not the absence of
+        # one. Rendering nothing for it is indistinguishable from the tool
+        # never having run at all, which then falls through to
+        # `render_unavailable()` and can surface a stale error from an
+        # earlier, already-superseded attempt instead of this result.
+        changed = answer.world_diff.get("changed") or []
+        pairing_id = answer.world_diff.get("pairing_id")
+        delay = answer.world_diff.get("delay_hours")
+        scope = f" for {pairing_id}" if pairing_id else ""
+        scope += f" with a {delay}h delay" if delay else ""
+        if changed:
+            lines.append(f"\n{len(changed)} change(s){scope} versus the base world:")
+            for c in changed:
+                lines.append(
+                    f"  {c.get('crew_id')} ({c.get('role')}): "
+                    f"{c.get('legal_before')} -> {c.get('legal_after')} "
+                    f"— {c.get('detail')}")
+        else:
+            lines.append(f"\nNo change{scope}: every crew member's legal "
+                         f"status is unaffected.")
 
     return "\n".join(lines)
 

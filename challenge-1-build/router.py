@@ -130,6 +130,9 @@ RULES: tuple[Rule, ...] = (
     # Gate questions first: distinctive vocabulary that would otherwise be
     # caught by "delayed" (disruption) or "exceed"/"limit" (legality).
     Rule(Intent.CHECK_GATE, GATE_RE, "gate"),
+    # "Controller" names the desk, never a crew member -- distinctive enough
+    # to check before anything else claims the sentence.
+    Rule(Intent.LOOKUP_CONTROLLERS, _p(r"\bcontrollers?\b"), "controllers"),
     # ---- tier 3 -----------------------------------------------------------
     Rule(
         # First, because "draft the callout notification" also contains
@@ -164,13 +167,15 @@ RULES: tuple[Rule, ...] = (
         Intent.RANK_OPTIONS,
         # Note: no bare `\brank\b` — "what is C-2087's rank" is a tier-1
         # lookup about seniority, not a request to rank anything.
+        # Also no `\bdraft the\b` / `\bnotification\b` -- both are already
+        # caught by DRAFT_NOTIFICATION's rule above, which is checked first,
+        # so either alternative here could never be the one that wins.
         _p(r"\branked\b", r"\brank (the |these )?options\b", r"\brank them\b",
            r"\brecommend", r"\bwhat should\b", r"\bshould (it|we|they|the desk)\b",
            r"\bbest (option|course|plan)\b", r"\bresolution options\b",
            r"\boptions with costs?\b", r"\boptimal\b", r"\bproduce .*options\b",
            r"\brecovery plan\b", r"\boutline .*\bplan\b", r"\bbriefing\b",
-           r"\bcheapest\b", r"\bleast (cost|expensive)\b",
-           r"\bdraft the\b", r"\bnotification\b"),
+           r"\bcheapest\b", r"\bleast (cost|expensive)\b"),
         "rank",
     ),
     # ---- tier 2 -----------------------------------------------------------
@@ -377,7 +382,7 @@ You classify crew-control questions. Reply with JSON only:
 
 Valid intents:
   Tier 1  LOOKUP_ROSTER LOOKUP_RESERVE LOOKUP_DUTY_CLOCK LOOKUP_CERT
-          LOOKUP_FLIGHT LOOKUP_CREW EXPLAIN_RULE CHECK_GATE
+          LOOKUP_FLIGHT LOOKUP_CREW EXPLAIN_RULE CHECK_GATE LOOKUP_CONTROLLERS
   Tier 2  FIND_REPLACEMENT CHECK_LEGALITY IMPACT_OF_EVENT
   Tier 3  RANK_OPTIONS SIMULATE_WHATIF JOINT_PLAN RESOLVE_ILLEGAL
 
@@ -422,6 +427,63 @@ def route_llm(text: str, ents: Entities, triage: TriageFn) -> Route:
     )
 
 
+_QUESTION_INTENT_MAP: dict[str, Intent] | None = None
+
+
+def _question_intent_map() -> dict[str, Intent]:
+    """`{question_id: intent}` for the 38 gold questions, built by running
+    each through `route_deterministic()` itself rather than from a second,
+    hand-maintained source of truth -- this dataset's own documented
+    property is that all 38 already classify correctly by regex alone, so
+    this is reading off an already-verified fact, not asserting a new one.
+    Built once, cached: computed from a fixed 38-row file, so it can never
+    go stale within a process lifetime."""
+    global _QUESTION_INTENT_MAP
+    if _QUESTION_INTENT_MAP is None:
+        mapping: dict[str, Intent] = {}
+        for q in json.loads((config.DATA_DIR / "questions.json").read_text()):
+            if decided := route_deterministic(q["prompt"], extract(q["prompt"])):
+                mapping[q["question_id"]] = decided.intent
+        _QUESTION_INTENT_MAP = mapping
+    return _QUESTION_INTENT_MAP
+
+
+# A semantic match this weak is worse than admitting no match at all --
+# below this, fall through to the Triage Agent (or the safe LOOKUP_CREW
+# default) rather than act on a resemblance too faint to trust.
+_SEMANTIC_MATCH_THRESHOLD = 0.65
+
+
+def route_semantic(text: str, ents: Entities) -> Route | None:
+    """A question that resembles one of the 38 gold questions closely
+    enough to borrow its intent, for phrasing no regex anticipated ("is
+    captain A Nair available?" rather than "who is qualified as captain").
+
+    Entities still come from THIS text, never the matched example's --
+    matching only ever borrows *what kind* of question this is, exactly
+    the same boundary `route_llm`'s Triage Agent already respects.
+    `None` (not a guess) whenever the ledger/embedding model isn't
+    configured, or nothing clears the confidence threshold.
+    """
+    from core_engine import intent_search
+
+    matches = intent_search.best_matches(text, top_k=1)
+    if not matches or matches[0]["blended_score"] < _SEMANTIC_MATCH_THRESHOLD:
+        return None
+
+    best = matches[0]
+    intent = _question_intent_map().get(best["question_id"])
+    if intent is None:
+        return None
+
+    return Route(
+        intent=intent, tier=intent.tier, entities=ents,
+        confidence=Confidence.MEDIUM, matched_rule=f"semantic:{best['question_id']}",
+        notes=[f"resembles {best['question_id']!r} "
+               f"(score {best['blended_score']}): {best['prompt']!r}"],
+    )
+
+
 def route(text: str, triage: TriageFn | None = None) -> Route:
     """Classify a controller's question.
 
@@ -435,6 +497,9 @@ def route(text: str, triage: TriageFn | None = None) -> Route:
     ents = extract(text)
     if decided := route_deterministic(text, ents):
         return decided
+
+    if semantic := route_semantic(text, ents):
+        return semantic
 
     if triage is None:
         # No Triage Agent wired up (e.g. running offline / under test):
