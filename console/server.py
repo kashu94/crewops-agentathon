@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Crew Ops Console -- a small API + static server in front of the
-challenge-1-build engine, for a browser-based demo of everything built in
-this bonus track: resilience-scored recommendations, the four decision
-policies, and cross-disruption contention backed by the Postgres ledger.
+challenge-1-build engine. A browser demo of this bonus track: resilience-
+scored recommendations, the four decision policies, and cross-disruption
+contention backed by the Postgres ledger.
 
 Stdlib only, matching this repo's own `devui/`-style convention (no new
-framework dependency for a debug/demo console). Three controller identities
-share one running server and one Postgres ledger -- open this URL in three
-browser tabs with a different `?controller=` each to see contention appear
-live across them, exactly like the reference UI this was modeled on.
+framework dependency for a debug/demo console). Three controllers share
+one running server and one Postgres ledger -- open this URL in three
+browser tabs, each with a different `?controller=`, to see contention
+appear live across them, like the reference UI this was modeled on.
 
 Usage:
     python server.py                  # http://localhost:8600
@@ -54,14 +54,12 @@ from schemas import AdvisorResponse
 from tools import ToolError, dispatch
 
 # `agents.py` imports `azure-ai-projects`/`azure-identity`/`openai` at module
-# level -- packages this console has never required before, since everything
-# else here is deterministic. A plain top-level import would crash this
-# entire console on startup for anyone who hasn't installed the full
-# repo-root `requirements.txt` (a bare venv for just the deterministic
-# console, say), even though they'd never touch the Advisor Agent fallback.
-# Caught here, once, so the rest of the console works exactly as before
-# either way; `_init_advisor_agents()` below is what actually decides
-# whether the fallback is live.
+# level -- packages this console never needed before, since everything else
+# here is deterministic. A plain top-level import would crash the whole
+# console on startup for anyone who only installed a bare venv for the
+# deterministic console, even if they never touch the Advisor Agent
+# fallback. Caught here, once, so the rest of the console works the same
+# either way; `_init_advisor_agents()` below decides if the fallback is live.
 try:
     from agents import (
         PROJECT_CONNECTION_STRING, ExplainerAgent, ResolutionAdvisorAgent,
@@ -75,13 +73,13 @@ STATIC = Path(__file__).resolve().parent / "static"
 PORT = 8600
 
 CONTROLLERS = config.CONTROLLERS
-"""Single-sourced from `config.py` so a chat question answered by
-`core_engine.port.JsonToolPort.list_controllers()` can never disagree with
-what this console's own UI shows."""
+"""Taken from `config.py` so a chat question answered by
+`core_engine.port.JsonToolPort.list_controllers()` always matches what
+this console's own UI shows."""
 
-# The vendored dataset's own scenario set is the disruption catalog -- no
-# fabricated disruptions, everything here is one of `data/scenarios.json`'s
-# six engineered cases (S6's two simultaneous events are split into two
+# The disruption catalog is the vendored dataset's own scenario set -- no
+# made-up disruptions. Everything here is one of `data/scenarios.json`'s
+# six built-in cases (S6's two simultaneous events are split into two
 # disruption records, since each competes for cover independently).
 DISRUPTIONS: list[dict[str, object]] = [
     {"id": "S1", "title": "ATR captain sick call", "event_type": "SICK_CREW",
@@ -112,10 +110,11 @@ for _d in DISRUPTIONS:
 
 PORT_INSTANCE = JsonToolPort()
 
-# Set once by `_init_advisor_agents()` at server startup, and only if
-# PROJECT_CONNECTION_STRING is configured -- stay None otherwise, so `_ask()`
-# keeps giving its honest "needs the Advisor Agent" decline instead of
-# crashing when this console is run with no Azure Foundry deployment.
+# Set once by `_init_advisor_agents()` at server startup, only if
+# PROJECT_CONNECTION_STRING is configured -- otherwise stays None, so
+# `_ask()` keeps giving its honest "needs the Advisor Agent" decline
+# instead of crashing when this console runs with no Azure Foundry
+# deployment.
 _TRIAGE_AGENT: TriageAgent | None = None
 _ADVISOR_AGENT: ResolutionAdvisorAgent | None = None
 _EXPLAINER_AGENT: ExplainerAgent | None = None
@@ -124,9 +123,9 @@ _EXPLAINER_AGENT: ExplainerAgent | None = None
 def _init_advisor_agents() -> None:
     """Create the three Foundry agents once, at server startup, not per
     request -- agent creation is a network round trip to Foundry, and the
-    whole point of doing this here is that a controller's first unclassified
-    question doesn't pay for it. Failure here (no deployment, bad
-    credentials, Foundry unreachable) is caught and logged, not raised: this
+    point of doing this here is that a controller's first unclassified
+    question doesn't have to pay for it. Failure here (no deployment, bad
+    credentials, Foundry unreachable) is caught and logged, not raised: the
     console must keep serving the deterministic pipeline either way."""
     global _TRIAGE_AGENT, _ADVISOR_AGENT, _EXPLAINER_AGENT
     if not PROJECT_CONNECTION_STRING:
@@ -157,15 +156,14 @@ for _g in json.loads((BUILD_DIR / "data" / "boarding_gates.json").read_text()):
 def _requirement_detail(pairing_id: str, unavailable_crew_id: str, role: str) -> dict[str, object]:
     """Everything the reference UI's "What needs covering" card and its
     accordions show, pulled straight from the same vendored dataset
-    `find_options` already reasons over -- no new numbers invented for the
-    UI, just more of what was already computed or already sitting in
-    `data/*.json` (`ripple`'s own ledger-free seat count, the roster, the
-    reserve pool, the boarding-gate list) laid out the way the reference app
-    lays it out.
+    `find_options` already reasons over -- no new numbers made up for the
+    UI, just what's already computed or already sitting in `data/*.json`
+    (`ripple`'s own ledger-free seat count, the roster, the reserve pool,
+    the boarding-gate list), laid out the way the reference app does.
 
-    One number that dataset genuinely doesn't have -- a real passenger/
-    booking count -- is left out rather than approximated from seats, same
-    call as the Command Center's own `seats_at_risk` already makes."""
+    One number the dataset genuinely doesn't have -- a real passenger/
+    booking count -- is left out rather than guessed from seats, the same
+    call the Command Center's own `seats_at_risk` already makes."""
     world = PORT_INSTANCE.world
     days = world.duty_days(pairing_id)
     flights = world.pairing_flights.get(pairing_id, [])
@@ -244,7 +242,7 @@ def _load_disruption(disruption_id: str, controller: str) -> dict[str, object]:
     """Everything one disruption detail page needs: the recommendation
     engine's output, or -- for an event with no crew_id (a station closure,
     an aircraft delay) -- the honest "no cover requirement can be derived"
-    case the reference UI also shows rather than fabricating one."""
+    case the reference UI also shows, rather than making one up."""
     d = _resolve_disruption(disruption_id)
     status = _disruption_status(disruption_id)
     base = {
@@ -260,7 +258,7 @@ def _load_disruption(disruption_id: str, controller: str) -> dict[str, object]:
         return base
 
     # Use the scenario's own stated pairing_id, not `assignment_for_crew` --
-    # crew fly several pairings across the week, and resolving by crew_id
+    # crew fly several pairings across the week, so resolving by crew_id
     # alone can silently pick a different one than the scenario names.
     role = PORT_INSTANCE.world.crew[d["crew_id"]].rank
     result = PORT_INSTANCE.find_options(
@@ -275,7 +273,7 @@ def _load_disruption(disruption_id: str, controller: str) -> dict[str, object]:
     cheapest = (result.get("policies") or {}).get("cheapest")
     if balanced:
         # `options` is already cost-sorted (port.py's `legal.sort(...)`), so
-        # the first entry that isn't Balanced's own pick is its runner-up.
+        # the first entry that isn't Balanced's own pick is the runner-up.
         crew_options = [o for o in result["options"] if o["crew_id"]]
         runner_up = next((o for o in crew_options if o["crew_id"] != balanced["crew_id"]), None)
         base["balanced_comparison"] = {
@@ -297,7 +295,7 @@ def _load_disruption(disruption_id: str, controller: str) -> dict[str, object]:
     # this page's own numbers, gathered from where they naturally surface
     # rather than a fresh query: this disruption's own resolution (above),
     # plus whichever committed candidates now show up in `excluded` as
-    # `taken_by` someone. No fabricated timeline, just what's already here.
+    # `taken_by` someone. No made-up timeline, just what's already here.
     seen_pairings: set[str] = set()
     related: list[dict[str, object]] = []
     if base.get("commitment"):
@@ -313,16 +311,15 @@ def _load_disruption(disruption_id: str, controller: str) -> dict[str, object]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    # Without this, BaseHTTPRequestHandler defaults to HTTP/1.0 while still
-    # accepting a client's HTTP/1.1 keep-alive attempt -- a real browser (and
-    # Node's fetch) then tries to reuse the same connection for a second
-    # request, which the server never actually agreed to keep open. The
-    # first request on a connection succeeds; the second intermittently
-    # fails with a broken pipe. This is what "clicking approve sometimes
-    # does nothing" looks like from the browser: the click's own fetch call
-    # can land on exactly that half-dead connection. Every response here
-    # already sends a correct Content-Length, which is the one precondition
-    # HTTP/1.1 keep-alive needs to work correctly.
+    # Without this, BaseHTTPRequestHandler defaults to HTTP/1.0 but still
+    # accepts a client's HTTP/1.1 keep-alive attempt -- a real browser (or
+    # Node's fetch) then tries to reuse the connection for a second request,
+    # which the server never actually agreed to keep open. The first
+    # request succeeds; the second intermittently fails with a broken pipe.
+    # This is what "clicking approve sometimes does nothing" looks like from
+    # the browser: the click's fetch call lands on that half-dead
+    # connection. Every response here already sends a correct
+    # Content-Length, the one thing HTTP/1.1 keep-alive needs to work.
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: object) -> None:  # quieter default logging
@@ -376,9 +373,9 @@ class Handler(BaseHTTPRequestHandler):
         except ToolError as exc:
             self._error(400, f"{exc.code}: {exc.message}")
         except Exception as exc:  # a bug here must not take the server down
-            traceback.print_exc()  # the response may fail to send (a client
-            # that already gave up looks identical to a server bug from the
-            # client's side); this is what actually explains a 500.
+            traceback.print_exc()  # sending the response can also fail (a
+            # client that already gave up looks the same as a server bug
+            # from the client's side); this log is what actually explains a 500.
             self._error(500, f"{type(exc).__name__}: {exc}")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -408,9 +405,9 @@ class Handler(BaseHTTPRequestHandler):
         statuses = {row["disruption_id"]: row for row in ledger.list_open_disruptions()}
         open_ids = [d["id"] for d in DISRUPTIONS if statuses.get(d["id"], {}).get("status", "open") == "open"]
         # `ripple`'s own "passengers" figure is seat capacity on the affected
-        # flights, not a real booking count -- the dataset carries no load
-        # factor. Reported once, honestly labelled, rather than as two
-        # different-sounding numbers derived from the one figure we have.
+        # flights, not a real booking count -- the dataset has no load
+        # factor. Reported once, honestly labelled, instead of as two
+        # different-sounding numbers derived from the same figure.
         seats_at_risk = 0
         for d in DISRUPTIONS:
             if d["id"] not in open_ids or not d["pairing_id"]:
@@ -467,13 +464,13 @@ class Handler(BaseHTTPRequestHandler):
 
         `router.py`'s ~20 deterministic rules settle every one of this
         dataset's 38 gold questions without a model call at all, so that
-        path covers the large majority of real questions with zero LLM
-        involvement -- not a stand-in for one. The one gap is a question the
-        router genuinely can't classify (SIMULATE_WHATIF, RESOLVE_ILLEGAL,
-        or free-form phrasing like "hey"): if `_init_advisor_agents()`
-        managed to stand up a live Foundry connection at startup, that gap
-        is handed off to the real `agents.py` pipeline instead of guessed
-        at; if not, it says so plainly, the same discipline
+        path covers most real questions with zero LLM involvement -- it's
+        not a stand-in for one. The one gap is a question the router
+        genuinely can't classify (SIMULATE_WHATIF, RESOLVE_ILLEGAL, or
+        free-form phrasing like "hey"): if `_init_advisor_agents()` managed
+        to stand up a live Foundry connection at startup, that gap is
+        handed off to the real `agents.py` pipeline instead of guessed at;
+        if not, it says so plainly, the same discipline
         `pipeline.explain_no_tools()` already applies to its own gaps.
         """
         query = (query or "").strip()
@@ -481,11 +478,11 @@ class Handler(BaseHTTPRequestHandler):
             return {"query": query, "narrative": "Ask a question about a crew member, "
                     "pairing, flight, or rule -- e.g. \"Is C-2087 legal to cover P-2291?\""}
 
-        # A plain greeting is not a crew-ops question, and answering it with
-        # a model call risks it reaching for one of the fixed intent labels
-        # anyway (see the EXPLAIN_RULE misfire this replaced) -- a fixed
-        # template costs nothing and can't hallucinate, unlike a model that
-        # has no "just say hi back" option in its own instructions.
+        # A plain greeting is not a crew-ops question, and a model call
+        # risks it reaching for one of the fixed intent labels anyway (see
+        # the EXPLAIN_RULE misfire this replaced) -- a fixed template costs
+        # nothing and can't hallucinate, unlike a model with no "just say
+        # hi back" option in its own instructions.
         if _GREETING_RE.fullmatch(query.strip(" !.?")):
             return {
                 "query": query, "classified": False, "intent": None, "tier": None,
@@ -499,10 +496,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if mismatch := pipeline.stated_attribute_mismatch(query, PORT_INSTANCE):
             # Same pre-flight safety guard `agents.py`'s CLI path already
-            # runs -- a stated rank the roster contradicts is a wrong-person
-            # risk, so this has to stop the question here rather than let
-            # either the deterministic fast path or the Advisor Agent answer
-            # around a false premise.
+            # runs -- a stated rank that contradicts the roster is a
+            # wrong-person risk, so this has to stop the question here
+            # rather than let the deterministic fast path or the Advisor
+            # Agent answer around a false premise.
             route = router.route(query)
             return {
                 "query": query,
@@ -515,8 +512,8 @@ class Handler(BaseHTTPRequestHandler):
             }
 
         # No triage_fn: deterministic rules, then the semantic hybrid-search
-        # fallback inside route() itself -- both run here; only the LLM
-        # Triage Agent is excluded from this call (see the answer_question()
+        # fallback inside route() itself -- both run here. Only the LLM
+        # Triage Agent is skipped in this call (see the answer_question()
         # handoff below for where that still happens).
         route = router.route(query)
         trace, seen = [], set()
@@ -546,11 +543,11 @@ class Handler(BaseHTTPRequestHandler):
         elif _ADVISOR_AGENT is not None:
             # Empty trace, whether or not the router matched a rule -- a
             # matched rule with nothing for seed_calls()/followup_calls() to
-            # act on is exactly as unresolved as no match at all, and only
-            # the Advisor Agent's own tool-calling loop (Triage -> tool loop
-            # -> render -> Explainer -> verify), the same one `python
+            # act on is just as unresolved as no match at all. Only the
+            # Advisor Agent's own tool-calling loop (Triage -> tool loop ->
+            # render -> Explainer -> verify), the same one `python
             # agents.py` runs, can actually reason its way to an answer
-            # instead of declining on partial signal.
+            # instead of giving up on a partial signal.
             agent_response = answer_question(
                 query, PORT_INSTANCE, _TRIAGE_AGENT, _ADVISOR_AGENT, _EXPLAINER_AGENT)
             discarded = any("discarded" in u for u in agent_response.unknowns)
@@ -611,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
         return result
 
     def _joint_plan(self, disruption_id: str, other_ids: list[str]) -> dict[str, object]:
-        """Cost-minimal disjoint cover across this disruption and whichever
+        """Cheapest disjoint cover across this disruption and whichever
         other open disruptions it's contended with -- a thin wrapper around
         the existing `joint_plan` tool (Tool 7), not new solving logic."""
         ids = [disruption_id] + [i for i in other_ids if i != disruption_id]
@@ -627,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
         result = PORT_INSTANCE.joint_plan(events)
 
         # Map each pairing back to the disruption it came from, so the UI
-        # can say "S6A: assign ..." rather than making the reader translate
+        # can say "S6A: assign ..." instead of making the reader translate
         # pairing ids back to disruption titles themselves.
         pairing_to_disruption = {d["pairing_id"]: d["id"] for d in disruptions}
         pairing_to_title = {d["pairing_id"]: d["title"] for d in disruptions}
@@ -650,8 +647,8 @@ class Handler(BaseHTTPRequestHandler):
     def _commit_joint(self, disruption_id: str, payload: dict[str, object]) -> dict[str, object]:
         """One approval, one transaction: `commit_joint_decisions` re-checks
         every assignment and raises before writing anything if even one has
-        gone stale, so this either returns every assignment committed or
-        raises with none of them recorded -- never a partial result."""
+        gone stale. So this either commits every assignment or raises with
+        none of them recorded -- never a partial result."""
         committed_by = payload["committed_by"]
         assignments = [
             {"disruption_id": a["disruption_id"], "pairing_id": a["pairing_id"],
@@ -682,10 +679,10 @@ def _warm_ledger() -> None:
 
     Contention is only detected between two disruptions that have each been
     registered at least once (see `register_and_check_contention` in
-    ledger.py) -- so without this, whether S6A/S6B's genuine overlap is
-    visible depends on which pages happened to be opened, in which order,
-    since the last server restart. That is not something a live demo should
-    depend on getting right by accident.
+    ledger.py) -- so without this, whether S6A/S6B's real overlap shows up
+    depends on which pages happened to be opened, in what order, since the
+    last server restart. A live demo shouldn't depend on getting that right
+    by accident.
     """
     for d in DISRUPTIONS:
         if not d["crew_id"] or _disruption_status(d["id"]) == "resolved":

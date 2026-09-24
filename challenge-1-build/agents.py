@@ -8,9 +8,9 @@ Usage:
 
 Ports dCortex Crew Ops Advisor's pipeline — ROUTER -> PLANNER -> TOOL LOOP ->
 VERIFIER -> EXPLAINER — onto three Microsoft Foundry `PromptAgentDefinition`
-agents, following the same 2 h template as the other scenarios in this repo
-(a tool-using agent + a pure-reasoning agent) but with the exact agent count
-and tool set dCortex's own team shipped: their docs describe the system as
+agents. It follows the same 2 h template as the other scenarios in this repo
+(a tool-using agent + a pure-reasoning agent), but with the exact agent count
+and tool set dCortex's own team shipped. Their docs describe the system as
 "a pipeline with up to three model calls", which is exactly what these three
 classes are.
 
@@ -24,8 +24,8 @@ classes are.
                                          controller prose; never adds a fact
 
 The legality math (7 rules), duty-hour arithmetic, cost model and candidate
-search live in `core_engine/`, ported from dCortex's own `core/` package —
-the model never computes any of it, only chooses which tool answers the
+search live in `core_engine/`, ported from dCortex's own `core/` package.
+The model never computes any of it — it only chooses which tool answers the
 question in front of it.
 """
 
@@ -99,8 +99,8 @@ class TriageAgent:
         return self.agent
 
     def run(self, system: str, user_text: str) -> str:
-        """Classify one question. `system` is accepted to match the
-        `router.TriageFn` signature; it is already baked into the agent's
+        """Classify one question. `system` is accepted only to match the
+        `router.TriageFn` signature — it's already baked into the agent's
         instructions above, so only the question itself is sent."""
         conversation = self.openai.conversations.create()
 
@@ -148,9 +148,9 @@ class ResolutionAdvisorAgent:
                 model=config.ADVISOR_MODEL_DEPLOYMENT_NAME,
                 instructions=base_system_prompt(),
                 # The enriched schema puts `lookup`'s real column names
-                # directly in its own description -- guessing a plausible
-                # but wrong one (`departure` for `dep_station`) was the
-                # single biggest source of tier-1 tool failures before this.
+                # directly in its own description. Before this, guessing a
+                # plausible but wrong one (`departure` for `dep_station`)
+                # was the single biggest source of tier-1 tool failures.
                 tools=foundry_tools(schemas=schemas_for_port(self.port)),
             ),
         )
@@ -159,7 +159,7 @@ class ResolutionAdvisorAgent:
     def run_intent(self, route, query_text: str) -> list[TraceEntry]:
         """Seed deterministic calls, then let the model request more.
 
-        Returns the full trace. The model's own final text is never read —
+        Returns the full trace. The model's own final text is never read.
         `pipeline.build_answer()` builds the typed answer purely from the
         trace, so the model's only job here is choosing which tools to call.
         """
@@ -178,9 +178,9 @@ class ResolutionAdvisorAgent:
         run_calls(pipeline.followup_calls(route, trace))
 
         # A PromptAgentDefinition's instructions are fixed for the agent
-        # version, unlike a raw chat completion's system message — so the
-        # per-intent guidance that dCortex varies per call is folded into the
-        # input text instead of a system override.
+        # version, unlike a raw chat completion's system message. So the
+        # per-intent guidance that dCortex varies per call gets folded into
+        # the input text instead of a system override.
         guidance = INTENT_GUIDANCE.get(route.intent, "").strip()
         opening = (f"{guidance}\n\n" if guidance else "") + f"Controller's question: {query_text}"
 
@@ -274,14 +274,31 @@ class ExplainerAgent:
                     "speculative risk, or describe in the future tense ('this "
                     "will likely require...') something the data already "
                     "states as decided. Omitting a number that was given to "
-                    "you is exactly as wrong as inventing one that wasn't."
+                    "you is exactly as wrong as inventing one that wasn't. "
+                    "A number's LABEL is part of what it says, not decoration "
+                    "you can swap — restating a real, sourced number under a "
+                    "different field name than what gave it to you (e.g. "
+                    "calling someone's seniority their 'risk score', or their "
+                    "reachability minutes their 'duty headroom') is exactly as "
+                    "wrong as inventing the number itself, even though the "
+                    "verifier that checks numbers and ids cannot catch this "
+                    "one — it only confirms the digits appeared somewhere, "
+                    "not that you named what they actually measure. "
+                    "When you are given an enumerated list (every excluded "
+                    "candidate, every affected flight), 'concise' means "
+                    "tight wording, never a shortened list standing in for "
+                    "the whole one — every entry you were given, not a "
+                    "representative few. That verifier also cannot catch "
+                    "this: four real, correctly-sourced names out of twenty-"
+                    "two is every bit as wrong as one invented name, and it "
+                    "passes the check that would catch the invented one."
                 ),
             ),
         )
         return self.agent
 
     def run(self, system: str, user_content: str) -> str:
-        """One tool-free call: `system` is this request's specific
+        """One tool-free call. `system` is this request's specific
         instructions, `user_content` is the deterministic template to
         rewrite. Matches `explainer.ExplainFn`."""
         conversation = self.openai.conversations.create()
@@ -330,11 +347,11 @@ def answer_question(
     try:
         trace = advisor.run_intent(route, query)
     except openai.BadRequestError as exc:
-        # Azure's own content-filter layer refusing the request outright
-        # (e.g. a detected prompt-injection attempt) raises here rather
-        # than returning a normal response for the model to decline in its
-        # own words -- caught specifically (not every BadRequestError,
-        # which could also mean a real bug in how a call was built) so a
+        # When Azure's own content-filter layer refuses the request outright
+        # (e.g. a detected prompt-injection attempt), it raises here instead
+        # of returning a normal response for the model to decline in its own
+        # words. We catch this specifically, not every BadRequestError
+        # (which could also mean a real bug in how a call was built), so a
         # controller sees a clean, honest decline instead of a raw crash.
         body = getattr(exc, "body", None) or {}
         if isinstance(body, dict) and body.get("code") == "content_filter":
@@ -367,18 +384,28 @@ def answer_question(
     narrative = render(response)
     narrative = polish(response, explainer_agent.run)
 
-    result = verifier.verify(narrative, trace)
+    result = verifier.verify(narrative, trace, response.answer)
     if not result.ok:
-        # The Explainer Agent's draft made an unsourced claim: fall back to
-        # the deterministic template, which can only restate tool output.
+        # The Explainer Agent's draft made an unsourced claim, so fall back
+        # to the deterministic template, which can only restate tool output.
         narrative = render(response)
         if response.confidence is Confidence.HIGH:
             response.confidence = Confidence.MEDIUM
-        if bad := ", ".join(c.value for c in result.unsupported):
+        incomplete = [c.value for c in result.unsupported if c.kind == "completeness"]
+        unsourced = [c.value for c in result.unsupported if c.kind != "completeness"]
+        if unsourced:
             response.unknowns.append(
-                f"The Explainer Agent's draft claimed {bad}, which no tool "
-                f"output supports. That draft was discarded — what is shown "
-                f"above is rendered directly from the tool results."
+                f"The Explainer Agent's draft claimed {', '.join(unsourced)}, "
+                f"which no tool output supports. That draft was discarded — "
+                f"what is shown above is rendered directly from the tool "
+                f"results."
+            )
+        if incomplete:
+            response.unknowns.append(
+                f"The Explainer Agent's draft left out part of the answer "
+                f"({', '.join(incomplete)}). That draft was discarded — what "
+                f"is shown above is rendered directly from the tool results, "
+                f"in full."
             )
 
     response.narrative = narrative
@@ -387,10 +414,10 @@ def answer_question(
 
 
 def print_response(query: str, response: AdvisorResponse) -> None:
-    """Prints to the controller's screen -- the output boundary. PII
+    """Prints to the controller's screen — the output boundary. PII
     redaction runs here (see `pii.py`), never on `response` itself: the
     verifier has already checked the unredacted narrative against the
-    unredacted trace by this point, and redacting first would make every
+    unredacted trace by this point, and redacting earlier would make every
     real number in it look unsourced."""
     print(f"\n{'=' * 70}\nQ: {query}")
     print(f"   intent={response.intent}  tier={int(response.tier)}  "

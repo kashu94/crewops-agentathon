@@ -9,14 +9,14 @@ nothing about correctness depends on this succeeding.
 
 Which endpoint this needs
 --------------------------
-Fine-tuning is a classic Azure OpenAI resource operation, not a Foundry
-*project* operation -- it may or may not be exposed through the same
+Fine-tuning is an Azure OpenAI resource operation, not a Foundry *project*
+operation -- it may or may not be exposed through the same
 `AIProjectClient.get_openai_client()` used elsewhere in this repo, depending
 on your Foundry setup. If `AZURE_OPENAI_ENDPOINT` isn't set, this script
-falls back to `PROJECT_CONNECTION_STRING`; if that doesn't work for your
+falls back to `PROJECT_CONNECTION_STRING`. If that doesn't work for your
 project, open **Foundry portal -> your project -> Fine-tuning -> new job**
-once by hand, which shows the exact endpoint and SDK snippet for your
-resource, and set `AZURE_OPENAI_ENDPOINT` in `.env` to match.
+once by hand -- it shows the exact endpoint and SDK snippet for your
+resource -- and set `AZURE_OPENAI_ENDPOINT` in `.env` to match.
 
 Which model to fine-tune
 -------------------------
@@ -65,18 +65,30 @@ POLL_SECONDS = 30
 def _client():
     """Azure AD auth (`DefaultAzureCredential`), matching the rest of this
     repo's keyless-auth convention -- no API key needed if your identity has
-    the Cognitive Services OpenAI Contributor role on the resource."""
+    the Cognitive Services OpenAI Contributor role on the resource.
+
+    Plain `OpenAI(base_url=...)`, not `AzureOpenAI(azure_endpoint=...)`:
+    `AZURE_OPENAI_ENDPOINT` already includes `/openai/v1` (this resource's
+    newer unified API surface), and `AzureOpenAI`'s own path building
+    double-appends onto that and 404s -- the same fix already needed in
+    `core_engine/embeddings.py` for the same reason.
+
+    The token is fetched fresh here for the upload step, and refreshed
+    again in the polling loop below -- a fine-tuning job can run long
+    enough that a token grabbed once at the start expires before the job
+    finishes, unlike `AzureOpenAI`'s `azure_ad_token_provider`, which
+    refreshes itself automatically and has no equivalent on a plain
+    `OpenAI` client.
+    """
     from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-    from openai import AzureOpenAI
+    from openai import OpenAI
 
     token_provider = get_bearer_token_provider(
         DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
     )
-    return AzureOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        azure_ad_token_provider=token_provider,
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2026-01-01-preview"),
-    )
+    client = OpenAI(base_url=AZURE_OPENAI_ENDPOINT, api_key=token_provider())
+    client._token_provider = token_provider
+    return client
 
 
 def _upload(client, path: Path) -> str:
@@ -120,6 +132,7 @@ def main() -> None:
 
     seen_events: set[str] = set()
     while True:
+        client.api_key = client._token_provider()
         job = client.fine_tuning.jobs.retrieve(job.id)
         for event in client.fine_tuning.jobs.list_events(job.id, limit=20).data:
             if event.id not in seen_events:

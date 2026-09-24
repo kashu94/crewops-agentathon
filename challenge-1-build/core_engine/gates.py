@@ -4,11 +4,11 @@ Layered on top of the real flight schedule the same way `core_engine/world.py`
 layers rules over dataset facts: loaded once, held in memory, no per-question
 round trip. This data is itself fabricated (only the gate NUMBER is invented;
 everything else — the occupancy window, aircraft type, which flight — is
-derived from the real schedule). It is the one bonus tool in the lab (Tool
+derived from the real schedule). It's the one bonus tool in the lab (Tool
 10 of 10): `check_gate`.
 
 The window is departure-side only: it ends at a flight's own `dep_utc` and
-represents the gate held before *that* departure. There is no separate
+represents the gate held before *that* departure. There's no separate
 arrival/deplaning record.
 """
 
@@ -61,8 +61,8 @@ def occupant_at(world: GateWorld, gate: str, instant: datetime) -> dict[str, Any
 def next_at_gate(world: GateWorld, gate: str, flight_id: str) -> dict[str, Any] | None:
     """The record chronologically after `flight_id`'s own window at `gate`.
 
-    None when this is the last flight scheduled into that gate -- nothing to
-    collide with regardless of how long a delay runs.
+    None when this is the last flight scheduled into that gate — there's
+    nothing to collide with, no matter how long a delay runs.
     """
     siblings = world.by_gate.get(gate, ())
     idx = next((i for i, r in enumerate(siblings) if r["flight_id"] == flight_id), None)

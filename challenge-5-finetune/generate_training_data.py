@@ -13,20 +13,19 @@ consistent*: choosing the right tool call on the first try instead of
 iterating, and never inventing a tool call the deterministic planner
 (`pipeline.py::seed_calls`) would not have made.
 
-That reframes the whole data problem as **self-distillation**: the teacher is
-not a bigger model, it is `challenge-1-build`'s own deterministic core.
-`router.py` classifies a question with zero model calls for every shape in
-the gold set, and `pipeline.seed_calls()` / `followup_calls()` already know
-the exact, correct opening tool calls for most intents. So instead of hand-
-labeling training examples, this script:
+That makes this **self-distillation**: the teacher is not a bigger model,
+it is `challenge-1-build`'s own deterministic core. `router.py` classifies
+a question with zero model calls for every shape in the gold set, and
+`pipeline.seed_calls()` / `followup_calls()` already know the exact,
+correct opening tool calls for most intents. So instead of hand-labeling
+training examples, this script:
 
   1. Takes the 38 real questions in `challenge-1-build/data/questions.json`
      and generates many grounded variants of each by substituting every
      entity found in it (crew id, pairing id, station, date, rule id, gate
      number) for a different real value of the same type, drawn from the
      actual vendored dataset. The wording is untouched -- only identifiers
-     change -- so every variant stays grammatically real and semantically
-     valid.
+     change -- so every variant still reads like a real, valid question.
   2. Re-classifies each variant with the real `router.py` (deterministic; no
      model call) and computes the oracle tool-call trace with the real
      `pipeline.seed_calls()` / `followup_calls()` and `tools.dispatch()`.
@@ -75,11 +74,11 @@ import verifier
 from core_engine.port import JsonToolPort
 from entities import (
     AIRCRAFT_RE, CREW_RE, GATE_RE, ISO_DATE_RE, PAIRING_RE, RULE_RE,
-    STATION_RE, extract,
+    STATION_RE,
 )
 from explainer import render
 from schemas import AdvisorResponse
-from tools import TOOL_SCHEMAS, dispatch
+from tools import ADVISOR_TOOL_NAMES, TOOL_SCHEMAS, dispatch
 
 OUT_DIR = Path(__file__).resolve().parent / "data"
 
@@ -223,6 +222,11 @@ TOOLS_FIELD = [
         },
     }
     for t in TOOL_SCHEMAS
+    # The real Resolution Advisor Agent never sees `commit_decision` --
+    # it's a write action withheld for the human-in-the-loop gate (see
+    # `tools.ADVISOR_TOOL_NAMES`). Training on the full schema list would
+    # teach the model a tool it will never actually have in production.
+    if t["name"] in ADVISOR_TOOL_NAMES
 ]
 
 _CLOSING_TEXT = (
@@ -230,7 +234,7 @@ _CLOSING_TEXT = (
 )
 """Deliberately fact-free. `agents.py::run_intent()` never reads the
 Resolution Advisor's own final text -- `pipeline.build_answer()` builds the
-typed answer purely from the tool trace -- so training the model to add any
+typed answer purely from the tool trace. So training the model to add any
 specific claim here would teach a habit the real pipeline throws away, and
 risk teaching it to state things the verifier would otherwise catch."""
 

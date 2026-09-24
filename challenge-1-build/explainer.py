@@ -1,15 +1,16 @@
 """Answer object -> controller prose.
 
 Templates first, model second. The deterministic renderer below produces a
-correct, citable answer with no model in the loop at all, which means the
+correct, citable answer with no model in the loop at all. That means the
 system degrades to "terse but accurate" rather than to "broken" when the
-Explainer Agent is unavailable — and it gives the verifier something to check
+Explainer Agent is unavailable, and it gives the verifier something to check
 even on that path.
 
 `polish()` sends the template output to the Explainer Agent (`agents.py`) to
-rewrite into something a controller would actually say. It may reword; it may
-not introduce a fact, and `verifier.verify()` runs after it in `deploy.py` to
-enforce that — a rejected draft falls back to `render()`'s template verbatim.
+rewrite into something a controller would actually say. It may reword, but
+may not introduce a fact. `verifier.verify()` runs after it in `deploy.py`
+to enforce that — a rejected draft falls back to `render()`'s template
+verbatim.
 """
 
 from __future__ import annotations
@@ -33,15 +34,17 @@ from schemas import (
 
 
 ROW_LIMIT = 25
-"""Rows shown before a lookup listing is truncated — generous enough to clear
-every tier-1 gold answer (BLR alone carries a dozen reserves) with room over."""
+"""Rows shown before a lookup listing is truncated — generous enough to
+clear every tier-1 gold answer (BLR alone carries a dozen reserves), with
+room to spare."""
 
 
 def fmt_value(value: Any) -> str:
     """Render a backend value as a controller would read it.
 
-    `datetime.date`/`time`/`Decimal` reprs are unreadable and, worse, get
-    misread by the verifier as unsourced numeric claims. ISO strings fix both.
+    `datetime.date`/`time`/`Decimal` reprs are unreadable, and worse, get
+    misread by the verifier as unsourced numeric claims. ISO strings fix
+    both problems.
     """
     if isinstance(value, (dt.datetime, dt.date, dt.time)):
         return value.isoformat()
@@ -58,10 +61,10 @@ def who(crew_id: str | None, name: str | None = None,
         rank: str | None = None) -> str:
     """How a crew member is written, everywhere, without exception.
 
-    `Captain A. Nair (C-1042)` — the person first, because that is who the
-    controller phones, and the id in brackets because that is what goes into
-    the roster system and two people can share a surname. Falling back to the
-    bare id when no name is loaded is correct; inventing one is not.
+    `Captain A. Nair (C-1042)` — the person first, since that's who the
+    controller phones, and the id in brackets since that's what goes into
+    the roster system and two people can share a surname. Falling back to
+    the bare id when no name is loaded is correct; inventing one is not.
     """
     if not crew_id:
         return ""
@@ -133,9 +136,10 @@ def render_option(option: Option, show_rank: bool = True) -> str:
 def render_strategies(strategies: list[Option]) -> str:
     """The four-line executive summary: one representative per strategy,
     cheapest first, cancel always last (`find_options` already orders the
-    list this way -- this just labels each line, it doesn't re-sort). Not
-    `render_option()` -- that appends its own "· Xh delay", which would
-    double up with the delay this strategy's `action` text already states."""
+    list this way — this just labels each line, it doesn't re-sort). Not
+    `render_option()`, because that appends its own "· Xh delay", which
+    would double up with the delay this strategy's `action` text already
+    states."""
     if not strategies:
         return ""
     lines = ["Strategies considered:"]
@@ -177,8 +181,9 @@ def render_lookup(answer: LookupAnswer) -> str:
     noun = "record" if answer.count == 1 else "records"
     shown = answer.rows[:ROW_LIMIT]
 
-    # Rows of different shapes are different questions, and interleaving them
-    # produces a mostly-blank table — group by shape and give each its own.
+    # Rows of different shapes are different questions, and interleaving
+    # them would produce a mostly-blank table. Group by shape instead and
+    # give each its own table.
     groups: list[list[dict[str, Any]]] = []
     signatures: list[tuple[str, ...]] = []
     for row in shown:
@@ -308,6 +313,20 @@ def render_replacement(answer: ReplacementAnswer) -> str:
             if stage.dropped:
                 lines.append(f"  −{stage.dropped} {stage.stage}: {stage.reason}")
 
+    if answer.excluded:
+        # The funnel above is stage counts; this is "who, specifically, and
+        # why". It was already captured into the answer but never rendered
+        # until now, so "who got excluded and why" previously had nothing
+        # to draw on but whatever the model recalled from the raw tool
+        # result itself.
+        shown = answer.excluded[:ROW_LIMIT]
+        lines.append(f"\nExcluded ({len(answer.excluded)}):")
+        for e in shown:
+            subject = who(e.get("crew_id"), e.get("name"), e.get("rank")) or e.get("crew_id", "?")
+            lines.append(f"  {subject}: {e.get('reason', '')}")
+        if len(answer.excluded) > ROW_LIMIT:
+            lines.append(f"  ... and {len(answer.excluded) - ROW_LIMIT} more.")
+
     return "\n".join(lines)
 
 
@@ -342,9 +361,9 @@ def render_consequence(answer: ConsequenceAnswer) -> str:
         )
 
     if answer.world_diff is not None:
-        # An empty `changed` list is a real, computed finding -- "nothing's
-        # legal status flips under this scenario" -- not the absence of
-        # one. Rendering nothing for it is indistinguishable from the tool
+        # An empty `changed` list is a real, computed finding — "nobody's
+        # legal status flips under this scenario" — not the absence of one.
+        # Rendering nothing for it would be indistinguishable from the tool
         # never having run at all, which then falls through to
         # `render_unavailable()` and can surface a stale error from an
         # earlier, already-superseded attempt instead of this result.
@@ -463,10 +482,10 @@ def collect_citations(response: AdvisorResponse) -> list[Citation]:
 # Explainer Agent pass
 # --------------------------------------------------------------------------
 
-# Both passes below append `prompts.naming_rule()` rather than restating it.
-# How a person is written is one rule for the whole system — it lives in
-# `prompts/system.md`, the Resolution Advisor reads it there, and these get
-# the same words so the two cannot drift apart.
+# Both passes below append `prompts.naming_rule()` instead of restating it.
+# How a person is written is one rule for the whole system. It lives in
+# `prompts/system.md`, the Resolution Advisor reads it there, and these use
+# the same words so the two can't drift apart.
 
 _LOOKUP_INSTRUCTIONS = """\
 You are answering an airline crew controller's factual question.
@@ -560,11 +579,11 @@ def polish(response: AdvisorResponse, explain: ExplainFn | None = None) -> str:
 
     Falls back to the template verbatim when no Explainer Agent is wired up.
 
-    Tier 1 gets its own instructions rather than the recommendation ones, and
+    Tier 1 gets its own instructions instead of the recommendation ones, and
     keeps its tables underneath the prose. Two lookup shapes still get no
     model pass at all: an answer with no rows has only the tools' own error
     text to offer, and EXPLAIN_RULE's answer *is* the regulation text, so
-    summarising it can only drift from it.
+    summarising it could only drift from it.
     """
     template = render(response)
     if explain is None:
@@ -577,9 +596,9 @@ def polish(response: AdvisorResponse, explain: ExplainFn | None = None) -> str:
                         f"Question: {response.query}\n\n{template}") or "").strip()
         return text or template
 
-    # Never paraphrase a tool failure — the error text is already written for
-    # a controller and often carries the only actionable content, e.g. "there
-    # is no crew C-1045, did you mean C-1042?".
+    # Never paraphrase a tool failure. The error text is already written for
+    # a controller and often carries the only actionable content, e.g.
+    # "there is no crew C-1045, did you mean C-1042?".
     if not has_content(response.answer):
         return template
 

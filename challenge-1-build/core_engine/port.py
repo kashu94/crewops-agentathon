@@ -1,14 +1,14 @@
 """`JsonToolPort` — the real engine behind the tool boundary.
 
-Satisfies `tools.ToolPort` by computing answers from the operation rather
-than replaying fixtures, so it works for any pairing rather than only the
-ones with a published scenario answer key.
+Implements `tools.ToolPort` by computing answers from the actual data,
+instead of replaying fixed answers. That way it works for any pairing, not
+just the ones with a pre-written scenario answer.
 
-This merges what dCortex Crew Ops Advisor split into `PostgresToolPort` (raw
-row access) and `CoreToolPort` (legality-dependent tools) into one class,
-because there is exactly one backend here: the vendored dataset JSON files in
-`../data/`, loaded once and held in memory. `ResolutionAdvisorAgent` in
-`agents.py` is the only caller.
+dCortex Crew Ops Advisor originally split this into `PostgresToolPort` (raw
+row access) and `CoreToolPort` (legality-dependent tools). Here they're
+merged into one class, because there is only one backend: the vendored
+dataset JSON files in `../data/`, loaded once and kept in memory.
+`ResolutionAdvisorAgent` in `agents.py` is the only caller.
 """
 
 from __future__ import annotations
@@ -43,13 +43,14 @@ FUNNEL_ORDER = ("considered", "qualified", "certified", "in position",
 class JsonToolPort:
     """The vendored dataset for facts, `core_engine/` for judgement."""
 
-    # Raw dataset file each entity is sourced from.
+    # Which raw dataset file each entity comes from.
     SOURCES = {
         "crew": "crew", "flights": "flights", "reserves": "reserve_pool",
         "certifications": "certifications", "risk_signals": "risk_signals",
         "costs": "costs", "pairings": "rosters",
-        # `rosters.json` nests these; flattening them here keeps one entity
-        # set regardless of how the source file is shaped.
+        # `rosters.json` nests these inside pairings. Flattening them here
+        # keeps a consistent entity shape no matter how the source file
+        # is structured.
         "pairing_crew": "rosters", "pairing_days": "rosters",
     }
     ENTITIES = tuple(SOURCES)
@@ -106,9 +107,9 @@ class JsonToolPort:
         """Which pairing operates a given leg.
 
         A controller names a disruption by route or flight ("captain of
-        BLR->BOM is out"), but cover is found per *pairing* — crew fly whole
-        pairings, not single legs. Without this hop the model would invent a
-        pairing id from the route.
+        BLR->BOM is out"), but cover is found per *pairing*, since crew fly
+        whole pairings, not single legs. Without this step the model would
+        have to guess a pairing id from the route.
         """
         for pairing in self._rows("pairings"):
             for day in pairing.get("days", []):
@@ -118,35 +119,67 @@ class JsonToolPort:
 
     # -- Tool 1: lookup ------------------------------------------------------
 
-    # Filter keys that name a specific real-world identifier rather than a
-    # descriptive attribute -- an equality filter on one of these that
-    # matches nothing is far more often a malformed or invented id (a
-    # transposed digit, a made-up pairing) than a genuine "no such record",
-    # so it is worth telling the id universe apart from an ordinary filter
+    # Filter keys that name a specific real-world id, rather than a
+    # descriptive attribute. If a filter on one of these matches nothing,
+    # it's usually a malformed or made-up id (a transposed digit, an
+    # invented pairing) rather than a genuine "no such record" — so these
+    # are worth checking against the real id universe. An ordinary filter
     # miss (e.g. `{"rank": "Captain", "base": "XYZ"}` legitimately matching
-    # zero rows needs no such check).
+    # zero rows) doesn't need this check.
     _ID_FIELD_KIND = {"crew_id": "crew", "pairing_id": "pairing", "flight_id": "flight"}
 
-    def lookup(self, entity: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def lookup(self, entity: str, filters: dict[str, Any] | None = None,
+               sort_by: str | None = None, sort_desc: bool = False,
+               limit: int | None = None,
+               group_by: str | list[str] | None = None) -> list[dict[str, Any]]:
+        filters = dict(filters or {})
+        if (entity in ("pairing_crew", "pairing_days", "pairings")
+                and "aircraft" in filters and "date" in filters
+                and "pairing_id" not in filters):
+            # "the Senior Cabin Crew on VT-DXB's pairing on 2026-09-16"
+            # names an aircraft and a date, not a pairing id -- neither of
+            # these entities has an `aircraft`+`date` field to filter on
+            # directly (pairing_crew/pairing_days don't carry `aircraft`
+            # at all), so without this the model has to fetch every
+            # pairing for that aircraft and inspect the nested `days`
+            # itself, which it does unreliably. Same resolution
+            # `check_legality`'s aircraft+date already does.
+            aircraft = filters.pop("aircraft")
+            date = filters.pop("date")
+            filters["pairing_id"] = self._resolve_pairing_for_aircraft_date(aircraft, date)
         resolved = resolve_filters(entity, filters, self.entity_fields(entity))
         rows = self._rows(entity)
         for key, want in resolved.items():
             rows = [r for r in rows if row_matches(r, key, want)]
 
+        if group_by:
+            # A headcount-by-category question ("by rank and base"), if left
+            # as a raw row fetch, forces counting rows by eye — exactly how
+            # "27 captains" turns into "26" or "9" (see Q3/Q13 in the test
+            # bank), even though the underlying data was filtered correctly.
+            # Aggregating here does the counting ourselves instead of
+            # trusting prose to get it right.
+            keys = [group_by] if isinstance(group_by, str) else list(group_by)
+            counts: dict[tuple, int] = {}
+            for r in rows:
+                gk = tuple(r.get(k) for k in keys)
+                counts[gk] = counts.get(gk, 0) + 1
+            return [dict(zip(keys, gk)) | {"count": n}
+                    for gk, n in sorted(counts.items())]
+
         if not rows:
-            # An empty result for a real id (just excluded by some other
-            # filter) is a legitimate answer and must not raise here --
+            # An empty result for a real id that some other filter just
+            # excluded is a legitimate answer, and must not raise here.
             # `require()` only raises when the id itself doesn't exist, so
-            # this only ever intercepts the invented/malformed-id case.
+            # this only catches the invented/malformed-id case.
             for key, want in resolved.items():
                 if (kind := self._ID_FIELD_KIND.get(key)) and isinstance(want, str):
                     self.require(kind, want)
 
-            # Same discipline for a crew name that matched nobody -- "A.
-            # Nayar" is far more often a typo of a real crew member ("A.
-            # Nair") than a genuine "no such person", so this is worth
-            # telling apart from an ordinary filter miss the same way a
-            # malformed id already is, just above.
+            # Same idea for a crew name that matched nobody. "A. Nayar" is
+            # usually a typo of a real crew member ("A. Nair") rather than a
+            # genuine "no such person", so it's worth telling apart from an
+            # ordinary filter miss the same way a malformed id is, above.
             if entity == "crew" and isinstance(resolved.get("name"), str):
                 suggestions = suggest_crew_names(self, resolved["name"])
                 if suggestions:
@@ -159,6 +192,22 @@ class JsonToolPort:
 
         if entity == "reserves":
             rows = with_crew_identity(rows, self._rows("crew"))
+
+        if sort_by:
+            # A "fastest-to-reach" / "highest risk score" question needs the
+            # true min/max over every row, including ties — something an LLM
+            # eyeballing dozens of raw rows gets wrong often enough (see Q8
+            # in the test bank: it picked 60 minutes when the real minimum,
+            # an 8-way tie, was 45). Sorting here instead of leaving that to
+            # the model also makes sure the extreme values survive
+            # `explainer.ROW_LIMIT` truncation, instead of some arbitrary
+            # subset of rows.
+            rows = sorted(
+                rows, reverse=sort_desc,
+                key=lambda r: (r.get(sort_by) is None, r.get(sort_by)),
+            )
+            if limit:
+                rows = rows[:limit]
         return rows
 
     # -- Tool 2: notification_brief ------------------------------------------
@@ -196,6 +245,14 @@ class JsonToolPort:
             "name": crew.name,
             "rank": crew.rank,
             "as_of": as_of.isoformat(),
+            # This is that single day's own hours. "What were their duty
+            # hours on <date>" asks for this, not the rolling window below —
+            # easy to mix up since both are "as of" the same date. Left out
+            # entirely (not 0.0) when the crew had no duty that day, so a
+            # real zero-duty day is never confused with "no record for this
+            # date".
+            "duty_hours_this_date": crew.daily_duty.get(as_of),
+            "flight_hours_this_date": crew.daily_flight.get(as_of),
             "duty_hours_7d": duty_7d,
             "duty_limit_7d": MAX_DUTY_HOURS_7D,
             "duty_headroom_7d": round(MAX_DUTY_HOURS_7D - duty_7d, 2),
@@ -213,9 +270,9 @@ class JsonToolPort:
         raise ToolError("UNRESOLVED_ENTITY", f"no rule {rule_id!r}")
 
     # -- Tool 11: search_rules --------------------------------------------
-    # Only for a paraphrased legality question that never names a rule id --
-    # explain_rule above is the exact-id path and stays the first choice
-    # whenever a rule id is actually given. A no-op ([]) when the ledger or
+    # Only for a paraphrased legality question that never names a rule id.
+    # explain_rule above is the exact-id path, and stays the first choice
+    # whenever a rule id is actually given. Returns [] when the ledger or
     # the embedding model isn't configured (see core_engine/rule_search.py).
 
     def search_rules(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
@@ -223,11 +280,11 @@ class JsonToolPort:
         return rule_search.search_rules(query, top_k=top_k)
 
     # -- Tool 12: suggest_crew_ids -----------------------------------------
-    # For a crew id shaped wrong ("C-10", not the dataset's 4-digit ids) --
-    # deterministic digit-prefix comparison against the real roster, never
-    # embedding-based: identity resolution stays exact everywhere else in
-    # this system, and a "did you mean" is no exception -- it only ever
-    # NAMES candidates for a human to pick from, never picks one itself.
+    # For a crew id in the wrong shape ("C-10", not the dataset's 4-digit
+    # ids). Uses a plain digit-prefix comparison against the real roster,
+    # never anything embedding-based — identity resolution stays exact
+    # everywhere in this system, and "did you mean" is no exception: it only
+    # ever lists candidates for a human to pick from, never picks one itself.
 
     def suggest_crew_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]:
         from core_engine.resolve import _digit_prefix_matches
@@ -240,22 +297,53 @@ class JsonToolPort:
             for cid in matches
         ]
 
+    # -- Tool 13: suggest_pairing_ids ---------------------------------------
+    # Same digit-prefix matching as `suggest_crew_ids`, for a wrong-shape
+    # pairing id ("P-22", not the dataset's 4-digit ids).
+
+    def suggest_pairing_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]:
+        from core_engine.resolve import _digit_prefix_matches
+
+        pairing_rows = {p["pairing_id"]: p for p in self._rows("pairings")}
+        matches = _digit_prefix_matches(near, list(pairing_rows), limit)
+        return [
+            {"pairing_id": pid, "aircraft": pairing_rows[pid].get("aircraft")}
+            for pid in matches
+        ]
+
+    # -- Tool 17: suggest_flight_nos -----------------------------------------
+    # Same digit-prefix matching again, for a wrong-shape flight number
+    # ("DX9999", not the dataset's 3-digit ones).
+
+    def suggest_flight_nos(self, near: str, limit: int = 3) -> list[dict[str, Any]]:
+        from core_engine.resolve import _digit_prefix_matches
+
+        flight_rows: dict[str, dict[str, Any]] = {}
+        for f in self._rows("flights"):
+            flight_rows.setdefault(f["flight_no"], f)
+        matches = _digit_prefix_matches(near, list(flight_rows), limit)
+        return [
+            {"flight_no": fno, "dep_station": flight_rows[fno].get("dep_station"),
+             "arr_station": flight_rows[fno].get("arr_station")}
+            for fno in matches
+        ]
+
     # -- Tool 14: list_controllers ---------------------------------------------
 
     def list_controllers(self) -> list[dict[str, Any]]:
-        """The controller desks sharing this operation. Not a crew role --
-        a controller dispatches, none of them fly, so this is never
-        confusable with a `lookup(entity='crew', ...)` result."""
+        """The controller desks sharing this operation. Not a crew role:
+        controllers dispatch and none of them fly, so this can't be
+        confused with a `lookup(entity='crew', ...)` result."""
         return [dict(c) for c in config.CONTROLLERS]
 
     # -- Tool 15: controller_issue_counts ---------------------------------
 
     def controller_issue_counts(self) -> list[dict[str, Any]]:
         """How many of the dataset's engineered disruption scenarios are
-        still open at each desk, from the live ledger -- not a static count,
-        since a controller may already have committed a decision on one.
-        A scenario never registered in the ledger yet counts as open: the
-        console never seeds it as "closed" ahead of a real decision."""
+        still open at each desk, read from the live ledger. Not a static
+        count, since a controller may already have committed a decision on
+        one. A scenario not yet registered in the ledger counts as open —
+        the console never marks it "closed" ahead of a real decision."""
         from core_engine import ledger
 
         statuses = {row["disruption_id"]: row["status"]
@@ -271,8 +359,9 @@ class JsonToolPort:
     def _universe(self, kind: str) -> tuple[dict[str, Any], Any]:
         """The valid id space for one kind, and how to describe a member.
 
-        The label matters as much as the id: "C-1024" alone is not something a
-        controller can confirm against, but "C-1024 (First Officer, DEL)" is.
+        The label matters as much as the id: "C-1024" alone gives a
+        controller nothing to confirm against, but "C-1024 (First Officer,
+        DEL)" does.
         """
         w = self.world
         if kind == "crew":
@@ -293,10 +382,10 @@ class JsonToolPort:
     def require(self, kind: str, value: str | None) -> str:
         """Confirm an id is real, or raise something a controller can act on.
 
-        Never substitutes a near match. `C-1042` and `C-1024` differ by one
-        transposed digit; in this dataset one is a captain and the other is
-        nobody. Silently correcting would dispatch a different human being to
-        an aircraft — so a near match is returned as a question, not an
+        Never silently swaps in a near match. `C-1042` and `C-1024` differ
+        by one transposed digit; in this dataset one is a captain and the
+        other is nobody. Auto-correcting would send a different human being
+        to an aircraft, so a near match comes back as a question, not an
         answer.
         """
         if not value:
@@ -318,9 +407,9 @@ class JsonToolPort:
         """A flight id from whatever the controller named.
 
         A bare flight number is ambiguous — some fly on three separate days
-        in this one week, each on a different pairing. Picking one silently
-        would answer a question nobody asked, so an undated flight number
-        comes back as a request for the date.
+        in one week, each on a different pairing. Silently picking one would
+        answer a question nobody asked, so an undated flight number gets a
+        request for the date instead.
         """
         if flight_id:
             self.require("flight", flight_id)
@@ -358,17 +447,31 @@ class JsonToolPort:
                    station: str | None = None) -> dict[str, Any]:
         gates = self.gates
 
+        # Checked up front rather than only where it's used — several
+        # branches below never read `at_utc` at all (e.g. no flight or gate
+        # named), so a malformed time like "12:75" (not a real minute) could
+        # otherwise slip through unnoticed instead of being flagged as an
+        # invalid instant.
+        if at_utc is not None:
+            try:
+                parse(at_utc)
+            except ValueError:
+                raise ToolError(
+                    "UNRESOLVED_ENTITY",
+                    f"{at_utc!r} isn't a valid UTC instant "
+                    f"(expected YYYY-MM-DDTHH:MM:SSZ) -- what time did you mean?")
+
         # Nothing named at all: an aggregate question. Two different
         # aggregates share this branch, told apart by whether a date was
-        # given -- "how many boarding gates are there" (static inventory,
+        # given: "how many boarding gates are there" (a static inventory,
         # true regardless of date) versus "how many gates were occupied on
         # <date>" (which flights actually used a gate that day). Answering
-        # the second with the first's number silently substitutes "how many
-        # gates exist" for "how many were busy", which is a different
-        # question with a different, usually larger, answer. Either one can
-        # additionally be scoped to a single station -- "how many gates
-        # does Bangalore occupy" silently answering for every station would
-        # be a different, wrong-looking number.
+        # the second with the first's number would quietly substitute "how
+        # many gates exist" for "how many were busy" — a different question
+        # with a different, usually larger, answer. Either one can also be
+        # scoped to a single station; answering for every station instead of
+        # just "how many gates does Bangalore occupy" would give a
+        # different, wrong-looking number.
         if not flight_id and not flight_no and not boarding_gate_number:
             all_gates = sorted(
                 g for g in gates.by_gate if not station or g.startswith(f"{station}-")
@@ -407,9 +510,9 @@ class JsonToolPort:
                 "boarding_gate_numbers": all_gates,
             }
 
-        # No flight named: a pure occupancy question -- "is BLR-G1 blocked
-        # right now / at this instant". Free ends up meaning no aircraft
-        # holds the gate in that instant, not that nothing operates through it.
+        # No flight named: a pure occupancy question — "is BLR-G1 blocked
+        # right now / at this instant". "Free" here means no aircraft holds
+        # the gate at that instant, not that nothing ever operates through it.
         if not flight_id and not flight_no and boarding_gate_number:
             if boarding_gate_number not in gates.by_gate:
                 raise ToolError(
@@ -427,10 +530,10 @@ class JsonToolPort:
                 "occupied_from": occupant["boarding_start_time"] if occupant else None,
                 "occupied_until": occupant["boarding_end_time"] if occupant else None,
                 # Every flight scheduled into this gate this week, not just
-                # the one instant above -- "which flights use gate X" asks
-                # for the whole week, and there is no single instant that
-                # answers that question, so both are always returned rather
-                # than making the model guess which framing to ask for.
+                # the one instant above — "which flights use gate X" asks
+                # about the whole week, and no single instant can answer
+                # that. Both are always returned so the model never has to
+                # guess which framing was meant.
                 "schedule": [
                     {"flight_id": r["flight_id"], "pairing_id": r["pairing_id"],
                      "boarding_start_time": r["boarding_start_time"],
@@ -440,8 +543,8 @@ class JsonToolPort:
             }
 
         # Named by flight. resolve_flight already reports a wrong date by
-        # naming the dates the flight actually operates on -- exactly the
-        # "correct gate, wrong date" case, so nothing extra is needed for it.
+        # naming the dates the flight actually operates on, which covers the
+        # "correct gate, wrong date" case, so nothing extra is needed here.
         fid = self.resolve_flight(flight_id, flight_no, date)
         record = gates.by_flight.get(fid)
         if record is None:
@@ -484,14 +587,32 @@ class JsonToolPort:
 
     def check_legality(self, crew_id: str, pairing_id: str | None = None,
                        flight_id: str | None = None, flight_no: str | None = None,
-                       date: str | None = None,
+                       date: str | None = None, aircraft: str | None = None,
                        delay_h: float = 0.0) -> dict[str, Any]:
         self.require("crew", crew_id)
         if not pairing_id:
-            # "Move C-2087 onto DX412" names a leg. Crew fly whole pairings,
-            # so the leg has to be resolved to the trip it belongs to.
-            pairing_id = self.pairing_for_flight(
-                self.resolve_flight(flight_id, flight_no, date))
+            if flight_id or flight_no:
+                # "Move C-2087 onto DX412" names a leg. Crew fly whole
+                # pairings, so we resolve the leg to the trip it belongs to.
+                pairing_id = self.pairing_for_flight(
+                    self.resolve_flight(flight_id, flight_no, date))
+            elif aircraft and date:
+                # "C-5417's rostered VT-DXB duty on 19 Sep" names an
+                # aircraft and a date, not a flight or a pairing id --
+                # resolve via the crew's own roster: which of their
+                # pairings uses this aircraft and covers this date. Without
+                # this, the model has to chain lookup(pairings,
+                # {aircraft}) + a per-candidate date/crew check itself,
+                # which it does unreliably -- it would sometimes pick
+                # whichever of the crew's pairings it found first,
+                # regardless of date, silently checking the wrong duty.
+                pairing_id = self._resolve_pairing_for_aircraft_date(
+                    aircraft, date, crew_id=crew_id)
+            else:
+                raise ToolError(
+                    "UNRESOLVED_ENTITY",
+                    "check_legality needs a pairing_id, a flight (id, or "
+                    "number+date), or an aircraft+date")
         self.require("pairing", pairing_id)
         c = assess(self.world, crew_id, pairing_id, delay_h)
         subject = self.world.crew[crew_id]
@@ -502,32 +623,51 @@ class JsonToolPort:
             "pairing_id": pairing_id,
             "legal": c.legal,
             "rules_checked": list(rules.ALL_RULES),
-            # Every evaluated rule, not just the blocking ones -- a passing
-            # rule's used/limit/headroom (e.g. "9.5h of 12.5h") is real data
-            # a question can ask about even when a different rule fails.
-            # The concise "show failures, else show all" display filtering
-            # already happens downstream in explainer.render_verdicts().
+            # Every evaluated verdict, not a fixed slice — a multi-day
+            # pairing gets all 7 rules re-checked PER DAY (a 2-day pairing
+            # is 13-14 verdicts, not 7), and a `[:7]` slice silently kept
+            # only day 1's, discarding day 2 entirely: `legal` could come
+            # back False from a day-2 failure while every verdict actually
+            # shown said PASS, which is exactly as wrong as inventing a
+            # verdict. A passing rule's used/limit/headroom (e.g. "9.5h of
+            # 12.5h") is also real data a question can ask about, whichever
+            # day it's from. The "show failures, else show all" display
+            # filtering already happens downstream, in
+            # explainer.render_verdicts().
             "verdicts": [asdict(v) | {"status": str(v.status)}
-                         for v in c.verdicts[:7]],
+                         for v in c.verdicts],
             "cost_inr": c.cost_inr,
             "delay_hours": c.delay_hours,
         }
 
+    def _resolve_pairing_for_aircraft_date(
+            self, aircraft: str, date: str, crew_id: str | None = None) -> str:
+        for pairing in self._rows("pairings"):
+            if pairing.get("aircraft") != aircraft:
+                continue
+            if crew_id and not any(
+                    c.get("crew_id") == crew_id for c in pairing.get("crew", [])):
+                continue
+            if any(d.get("date") == date for d in pairing.get("days", [])):
+                return pairing["pairing_id"]
+        who = f"{crew_id} isn't rostered on" if crew_id else "no pairing found for"
+        raise ToolError("UNRESOLVED_ENTITY", f"{who} {aircraft} on {date}")
+
     # -- Tool 16: same_pairing -------------------------------------------------
 
-    # A rank word stated ahead of a name -- "Captain A. Nair" -- disambiguates
-    # exactly the same way `entities.STATED_RANK_RE` does for "Captain
-    # C-2087": several surnames in this roster repeat across ranks (two
-    # "A. Nair"s: a Captain and Cabin Crew), so the rank the controller
-    # actually said is real signal, not something to discard before matching.
-    # Built from the same shared word list `entities.py` owns, rather than a
-    # separate copy that could drift out of sync with it.
+    # A rank word stated ahead of a name — "Captain A. Nair" — disambiguates
+    # the same way `entities.STATED_RANK_RE` does for "Captain C-2087".
+    # Several surnames in this roster repeat across ranks (there are two
+    # "A. Nair"s: a Captain and a Cabin Crew), so the rank the controller
+    # actually said is real signal and should not be thrown away before
+    # matching. Built from the same shared word list `entities.py` owns,
+    # instead of a separate copy that could drift out of sync.
     _RANK_PREFIX_RE = re.compile(rf"^({RANK_WORD_RE_FRAGMENT})\s+(.+)$", re.I)
 
     def _resolve_person(self, value: str) -> dict[str, Any]:
-        """A crew record from whatever the controller wrote -- a crew id, or
+        """A crew record from whatever the controller wrote: a crew id, or
         a name optionally preceded by a rank ("Captain A. Nair"). Never
-        guesses between two same-named, same-rank crew; the caller asks."""
+        guesses between two same-named, same-rank crew — it asks instead."""
         value = (value or "").strip()
         if not value:
             raise ToolError("UNRESOLVED_ENTITY", "a crew id or name is required")
@@ -561,14 +701,14 @@ class JsonToolPort:
         """Whether two crew members are rostered on the same pairing this
         week, each named by crew id or by name.
 
-        "Is Captain X paired with First Officer Y" is two lookups and a
-        comparison, not one -- both people have to be resolved to a crew id
-        and both pairing assignments fetched before the question is even
-        answerable, and splitting that across separate `lookup` calls is
+        "Is Captain X paired with First Officer Y" really needs two lookups
+        plus a comparison, not one: both people must be resolved to a crew
+        id and both pairing assignments fetched before the question can be
+        answered at all. Splitting that across separate `lookup` calls is
         exactly where a partial answer ("no data on X") comes from. This
         does the whole thing in one call and returns the comparison
-        directly, the same way `check_legality` returns a verdict rather
-        than leaving the model to add up rule results itself.
+        directly, the same way `check_legality` returns a verdict instead
+        of leaving the model to add up rule results itself.
         """
         crew_a, crew_b = self._resolve_person(a), self._resolve_person(b)
 
@@ -596,9 +736,10 @@ class JsonToolPort:
     def assignment_for_crew(self, crew_id: str) -> tuple[str, str]:
         """Which pairing a crew member is on, and in what role.
 
-        "C-1042 is sick" names a person, not a trip. The roster knows both
-        the pairing and the role, so neither has to be guessed — and the role
-        matters: replacing a captain with a first officer is not cover.
+        "C-1042 is sick" names a person, not a trip. The roster already
+        knows both the pairing and the role, so neither has to be guessed.
+        The role matters too: replacing a captain with a first officer is
+        not real cover.
         """
         self.require("crew", crew_id)
         for pairing_id, members in self.world.pairing_crew.items():
@@ -611,11 +752,11 @@ class JsonToolPort:
     def risk_scores(self) -> dict[str, float]:
         """Pre-computed disruption risk, per crew member.
 
-        Provided as input, not modelled here: treat it like a weather
-        forecast. So it rides alongside an option as information and never
-        enters the ranking — a risk score is not a rule, and letting one
-        reorder legal options would be exactly the prediction this system was
-        not built to make.
+        This is provided as input, not modelled here — treat it like a
+        weather forecast. It rides alongside an option as extra information
+        and never affects the ranking. A risk score is not a rule, and
+        letting it reorder legal options would be exactly the kind of
+        prediction this system isn't built to make.
         """
         return {r["crew_id"]: float(r["disruption_risk_score"])
                 for r in self.lookup("risk_signals")
@@ -628,19 +769,20 @@ class JsonToolPort:
         was generated, for pairings whose dates overlap this one. Returns
         `()` (a no-op) when the ledger is off or nothing overlaps.
 
-        `other_pairings` lets the caller pass in an already-fetched list
-        (see `find_options`, which loads every candidate's live pairings in
-        one bulk query rather than one Postgres round trip per candidate --
-        with a pool of 20-30 candidates, that difference was measured at
-        10+ seconds versus a few hundred milliseconds for one page). Left
-        `None`, this fetches for just this one crew_id instead -- the right
-        tradeoff for `commit_decision`'s single-candidate re-check, where
-        there is only ever one candidate to ask about.
+        `other_pairings` lets the caller pass in an already-fetched list.
+        `find_options` uses this to load every candidate's live pairings in
+        one bulk query instead of one Postgres round trip per candidate —
+        with a pool of 20-30 candidates, that was measured at 10+ seconds
+        versus a few hundred milliseconds for one page. Left as `None`, this
+        fetches for just this one crew_id instead, which is the right choice
+        for `commit_decision`'s single-candidate re-check, where there is
+        only ever one candidate to check.
 
-        Same-day is treated as overlapping rather than computing exact
-        report/release windows a second time here -- the safe direction to
-        be wrong in is treating two same-day duties as conflicting even if a
-        precise clock check might have cleared them, not the reverse."""
+        Same-day duties are treated as overlapping rather than computing
+        exact report/release windows again here. If we're going to be wrong,
+        it's safer to treat two same-day duties as conflicting — even if a
+        precise clock check would have cleared them — than the other way
+        around."""
         from core_engine import ledger
 
         if not ledger.enabled() or not this_dates:
@@ -664,15 +806,17 @@ class JsonToolPort:
                   commitments: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
         """If `crew_id` is excluded because of a pairing `_live_assigned`
         added (not one of the ~206 rows the vendored dataset shipped with),
-        and that pairing was committed through this console, who committed
-        it and to which disruption. `None` for every other exclusion reason
-        -- a rating gap, a rest-hour breach, or a conflict against the
-        dataset's own original roster, none of which any controller "took".
+        and that pairing was committed through this console, this returns
+        who committed it and to which disruption. Returns `None` for every
+        other exclusion reason — a rating gap, a rest-hour breach, or a
+        conflict against the dataset's own original roster — since none of
+        those were "taken" by any controller.
 
         `commitments` is pre-fetched once for the whole excluded list (see
-        `ledger.commitments_bulk`) -- calling `ledger.commitment_for()` here
-        per candidate was the same N+1 pattern `live_assignments_bulk`
-        exists to avoid, just discovered a call site later."""
+        `ledger.commitments_bulk`). Calling `ledger.commitment_for()` here
+        per candidate would repeat the same N+1 pattern `live_assignments_bulk`
+        exists to avoid — this is just another place where that pattern
+        could have crept back in."""
         for other_pairing, _report, _release in live_extra_by_crew.get(crew_id, ()):
             if commitment := commitments.get(other_pairing):
                 return commitment
@@ -686,19 +830,20 @@ class JsonToolPort:
                      event_type: str = "SICK_CREW",
                      narrative: str | None = None) -> dict[str, Any]:
         """`disruption_id`/`opened_by`/`event_type`/`narrative` are not part
-        of the model-facing tool schema (`tools.TOOL_SCHEMAS`) -- the console
+        of the model-facing tool schema (`tools.TOOL_SCHEMAS`). The console
         UI calls this directly, bypassing the Resolution Advisor's tool
         loop, to register a disruption and check contention against every
         other one currently open. A plain-English question routed through
-        the Advisor never sets them, and `disruption_id` then defaults to
+        the Advisor never sets them, so `disruption_id` then defaults to
         `pairing_id`."""
         if not pairing_id and crew_id:
             pairing_id, rostered_role = self.assignment_for_crew(crew_id)
             role = role or rostered_role
         # "I need a pilot for DX401" names a flight by its NUMBER. A flight_id
-        # is DX401-2026-09-15; the number alone is what a controller says, and
-        # it needs the same resolution check_legality and check_gate already
-        # do — including asking which date when the number flies on several.
+        # looks like DX401-2026-09-15; the number alone is what a controller
+        # actually says, and it needs the same resolution check_legality and
+        # check_gate already do — including asking which date, when the
+        # number flies on several.
         if not pairing_id and (flight_id or flight_no):
             flight_id = self.resolve_flight(flight_id, flight_no, date)
         if not pairing_id and flight_id:
@@ -723,7 +868,7 @@ class JsonToolPort:
         this_pairing_dates = {d.date for d in days}
 
         # One Postgres round trip for the whole candidate pool, not one per
-        # candidate -- see `_live_assigned`'s docstring for what the naive
+        # candidate — see `_live_assigned`'s docstring for what the naive
         # version costs.
         from core_engine import ledger
         bulk_live = ledger.live_assignments_bulk(
@@ -757,9 +902,9 @@ class JsonToolPort:
                 "crew_id": c.crew_id, "legal": True,
                 "name": who.name, "seniority": who.seniority,
                 "base": who.base, "reachability_minutes": who.reachability_minutes,
-                # Provided input, treated like a weather forecast: reported
-                # beside the option, never allowed to change its legality or
-                # its rank.
+                # Provided input, treated like a weather forecast: shown
+                # alongside the option, but never allowed to change its
+                # legality or its rank.
                 "disruption_risk_score": risk.get(c.crew_id),
                 "rules_checked": list(rules.ALL_RULES),
                 "cost_inr": c.cost_inr, "delay_hours": c.delay_hours, "rank": i,
@@ -782,12 +927,12 @@ class JsonToolPort:
         })
 
         # A policy-backed ranking across the four strategies a controller
-        # actually chooses between, one representative each -- the cheapest
-        # legal candidate in that strategy, since `legal` is already
-        # cost-sorted so the first one seen per strategy is the cheapest.
-        # A strategy with no legal candidate is left out rather than shown as
-        # unavailable: reporting "no reserve is legal" as a ranked option
-        # would be a claim this data doesn't support.
+        # actually chooses between, one representative candidate per
+        # strategy: the cheapest legal one. `legal` is already cost-sorted,
+        # so the first one seen for each strategy is the cheapest.
+        # A strategy with no legal candidate is left out entirely rather than
+        # shown as unavailable — reporting "no reserve is legal" as a ranked
+        # option would be a claim this data doesn't support.
         best_per_strategy: dict[str, Candidate] = {}
         for c in legal:
             if c.strategy not in best_per_strategy:
@@ -797,7 +942,7 @@ class JsonToolPort:
         for i, c in enumerate(best_per_strategy.values(), start=1):
             who = world.crew[c.crew_id]
             # The strategy label already says the kind (reserve/day-off/
-            # deadhead) -- repeating it via the full `.action()` phrasing
+            # deadhead). Repeating it via the full `.action()` phrasing
             # would say "Reserve callout — Assign ... (reserve callout)".
             who_text = f"{who.rank} {who.name} ({c.crew_id})" if who.name else f"{who.rank} {c.crew_id}"
             action = f"Assign {who_text}"
@@ -817,8 +962,9 @@ class JsonToolPort:
         })
 
         # Computed here, not in the renderer: a derived figure like "81x the
-        # cost of covering" is exactly what the verifier checks for arithmetic
-        # against sourced numbers, so it has to be sourced itself.
+        # cost of covering" is exactly what the verifier checks for correct
+        # arithmetic against sourced numbers, so it needs a traceable source
+        # itself.
         cheapest = next((o["cost_inr"] for o in options if o["crew_id"]), 0)
         cancel_cost = options[-1]["cost_inr"]
         recommended = next((o for o in options if o["crew_id"]), None)
@@ -826,15 +972,16 @@ class JsonToolPort:
         tiers = sorted({o["cost_inr"] for o in options if o["crew_id"]})
 
         # Four ways to read the same legal pool. "Balanced" applies this
-        # system's stated ordering -- safety/legality first (already true of
+        # system's stated ordering: safety/legality first (already true of
         # everything in `options`), then network-criticality, passenger
-        # impact and cascading risk (properties of *which disruption* this
-        # is, constant across every candidate in a single find_options call,
-        # so they can't separate candidates here -- they matter when ranking
-        # *between* open disruptions, see `commit_decision`/contention) --
-        # and cost last. That makes Balanced reduce to (resilience, cost)
-        # within one call, same tiebreak as Most Resilient: expected, not a
-        # bug, until cross-disruption ranking is layered on top.
+        # impact and cascading risk, and cost last. The middle factors are
+        # properties of *which disruption* this is — they stay constant
+        # across every candidate in a single find_options call, so they
+        # can't distinguish candidates here. They matter when ranking
+        # *between* open disruptions instead (see `commit_decision`/
+        # contention). That makes Balanced reduce to (resilience, cost)
+        # within one call — the same tiebreak as Most Resilient. That's
+        # expected, not a bug, until cross-disruption ranking is added.
         crew_options = [o for o in options if o["crew_id"]]
         policies = {}
         if crew_options:
@@ -858,14 +1005,15 @@ class JsonToolPort:
                 "resilience first within a single disruption's option list.")
 
         # Cross-disruption contention: register this disruption's current
-        # candidate pool, then ask what else already open also wants them.
-        # A no-op when LEDGER_DATABASE_URL isn't set (see core_engine/ledger.py),
-        # and equally a no-op when there's no real disruption_id -- a plain
-        # chat question ("who could cover P-2291?") is an inquiry, not a
-        # controller opening a disruption, and registering it anyway would
-        # create a phantom disruption keyed by the bare pairing_id that then
-        # "contends" with the real one for the exact same crew, purely
-        # because both track the same pairing under two different ids.
+        # candidate pool, then check whether any other open disruption also
+        # wants them. A no-op when LEDGER_DATABASE_URL isn't set (see
+        # core_engine/ledger.py), and equally a no-op when there's no real
+        # disruption_id. A plain chat question ("who could cover P-2291?")
+        # is an inquiry, not a controller opening a disruption, and
+        # registering it anyway would create a phantom disruption keyed by
+        # the bare pairing_id — which would then "contend" with the real one
+        # for the exact same crew, purely because both track the same
+        # pairing under two different ids.
         from core_engine import ledger
 
         disruption_key = disruption_id or pairing_id
@@ -926,10 +1074,10 @@ class JsonToolPort:
                         presented_options: list[dict[str, Any]] | None = None,
                         override_reason: str | None = None
                         ) -> dict[str, Any]:
-        """Human-confirmed only (see the schema comment in tools.py). Re-checks
-        legality against the live state one more time immediately before
-        writing -- the options shown to the controller may be seconds old,
-        and another desk could have committed the same person in between."""
+        """Human-confirmed only (see the schema comment in tools.py). Checks
+        legality against the live state once more, right before writing —
+        the options shown to the controller may be seconds old, and another
+        desk could have committed the same person in the meantime."""
         from core_engine import ledger
 
         if not ledger.enabled():
@@ -975,12 +1123,13 @@ class JsonToolPort:
         """A joint plan's assignments, committed together or not at all.
 
         Every assignment is re-checked for legality against the live state
-        first -- same re-check `commit_decision` does for a single pairing,
-        repeated per assignment here. If any one of them is no longer legal
-        (another desk committed that person to something else in the
-        seconds since the plan was previewed), the whole call raises before
-        `ledger.commit_joint` writes anything, so a partially-applied joint
-        plan can never exist: "one approval, one transaction."
+        first — the same check `commit_decision` does for a single pairing,
+        just repeated per assignment here. If any one of them is no longer
+        legal (say another desk committed that person to something else in
+        the seconds since the plan was previewed), the whole call raises
+        before `ledger.commit_joint` writes anything. That way a
+        partially-applied joint plan can never exist: one approval, one
+        transaction.
         """
         from core_engine import ledger
 
@@ -1041,17 +1190,16 @@ class JsonToolPort:
 
     def ripple(self, event: dict[str, Any]) -> dict[str, Any]:
         """Blast radius of a disruption, named however the controller
-        actually named it -- a pairing or crew id directly, a flight
-        (id, or number+date, resolved the same way `check_legality`/
-        `find_options` already do), or a station closure window, which
-        can touch several pairings at once and returns their combined
-        blast radius rather than requiring one `ripple` call per pairing.
-        Resolving these here, instead of requiring the caller to already
-        have chased flight -> pairing (or station -> every affected
-        pairing) through separate `lookup` calls first, is exactly the
-        pattern `check_legality`'s own `flight_no`+`date` handling already
-        uses -- the model naming what the controller said, not the id it
-        implies.
+        actually named it: a pairing or crew id directly, a flight (id, or
+        number+date, resolved the same way `check_legality`/`find_options`
+        already do), or a station closure window. A station window can
+        touch several pairings at once, so this returns their combined
+        blast radius instead of requiring one `ripple` call per pairing.
+        Resolving these here — instead of making the caller already chase
+        flight -> pairing (or station -> every affected pairing) through
+        separate `lookup` calls first — follows the same pattern
+        `check_legality`'s own `flight_no`+`date` handling already uses: the
+        model names what the controller said, not the id it implies.
         """
         event = event or {}
         pairing_id = event.get("pairing_id")
@@ -1145,7 +1293,7 @@ class JsonToolPort:
         }
 
     def _ripple_one(self, pairing_id: str) -> dict[str, Any]:
-        """The blast radius of losing crew on a single pairing -- the
+        """The blast radius of losing crew on a single pairing. This is the
         original, single-pairing shape of this tool, factored out so a
         station closure (below) can compute it once per affected pairing
         and combine the results, instead of only ever answering for one."""
@@ -1183,12 +1331,13 @@ class JsonToolPort:
     def joint_plan(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Cost-minimal cover across simultaneous disruptions.
 
-        The constraint that makes this joint is disjointness: one crew member
-        cannot cover two pairings at once. Without it the same cheap reserve
-        gets assigned to both, producing an infeasible plan.
+        The constraint that makes this "joint" is disjointness: one crew
+        member can't cover two pairings at once. Without it, the same cheap
+        reserve would get assigned to both, producing a plan that can't
+        actually work.
 
-        Ties are normal, so the count is reported rather than one assignment
-        being presented as uniquely right.
+        Ties are normal, so we report the count instead of presenting one
+        assignment as uniquely right.
         """
         pairings = [e.get("pairing_id") for e in events or [] if e.get("pairing_id")]
         if len(pairings) < 2:
@@ -1232,10 +1381,10 @@ class JsonToolPort:
         if not pairing_id:
             raise ToolError("UNRESOLVED_ENTITY", "simulate needs a pairing_id")
         # A pairing_id that doesn't exist must fail loudly, not fall through
-        # to `world.pairing_crew.get(pairing_id, ())` -- that silently
-        # returns an empty crew list, which produces the exact same
-        # `changed: []` "nothing breaks" result as a REAL pairing that
-        # genuinely has no impact. Those two cases must never look the same.
+        # to `world.pairing_crew.get(pairing_id, ())`. That would silently
+        # return an empty crew list, producing the same `changed: []`
+        # "nothing breaks" result as a REAL pairing that genuinely has no
+        # impact. Those two cases must never look the same.
         self.require("pairing", pairing_id)
 
         world = self.world

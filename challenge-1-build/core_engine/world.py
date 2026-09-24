@@ -2,7 +2,7 @@
 
 Loads the whole operation from the vendored JSON dataset once, then answers
 from memory. The dataset is under 700 KB, so a per-question round trip buys
-nothing; `JsonToolPort` (in `core_engine/port.py`) holds one immutable `World`
+nothing. `JsonToolPort` (in `core_engine/port.py`) holds one immutable `World`
 and forks it for what-ifs.
 
 This is a JSON-backed port of dCortex Crew Ops Advisor's `core/engine.py`,
@@ -23,7 +23,7 @@ from schemas import RuleVerdict
 from tools import ToolError
 from core_engine import rules
 from core_engine.duty import DutyDay, hours_between
-from core_engine.rules import ALL_RULES, CrewSnapshot
+from core_engine.rules import CrewSnapshot
 
 PILOT_ROLES = ("Captain", "First Officer")
 
@@ -74,9 +74,9 @@ class World:
     def on_reserve(self, crew_id: str, when: date, report: datetime) -> bool:
         """A reserve is usable only if the required report falls in the window.
 
-        Not the disruption time and not the departure — the report time,
-        after any positioning. Getting this wrong makes unavailable reserves
-        look available, which is the expensive direction to be wrong in.
+        Not the disruption time, and not the departure — the report time,
+        after any positioning. Getting this wrong would make unavailable
+        reserves look available, the expensive direction to be wrong in.
         """
         for day, start, end in self.reserves.get(crew_id, ()):
             if day == when and start <= report.time().replace(tzinfo=None) <= end:
@@ -85,7 +85,8 @@ class World:
 
     def reserve_pool_size(self, rank: str, base: str, when: date) -> int:
         """How many crew of this rank at this base are on call on `when`,
-        before any of them are used -- the denominator for `resilience`."""
+        before any of them are used. This is the denominator for
+        `resilience`."""
         return sum(
             1 for crew_id, windows in self.reserves.items()
             if any(d == when for d, _, _ in windows)
@@ -232,9 +233,9 @@ class Candidate:
     def action(self, rank_name: str, name: str = "") -> str:
         """The instruction a controller carries out.
 
-        The id stays in it — the id is what goes into the roster system, and
-        two people can share a surname. But a person is who they phone, so
-        the name leads when we have one.
+        The id always stays in it — it's what goes into the roster system,
+        and two people can share a surname. But a person is who they phone,
+        so the name leads when we have one.
         """
         kind = "reserve callout" if self.on_reserve else "day-off callout"
         if self.deadhead:
@@ -248,9 +249,9 @@ class Candidate:
         """Which of the four lines of defense this candidate belongs to.
 
         Deadhead is its own strategy regardless of whether the crew member
-        was on reserve or a day off before positioning -- a controller
-        thinking "who's already here" vs. "who do I bring in" cares about
-        that distinction more than the reserve/day-off split underneath it.
+        was on reserve or a day off before positioning. A controller
+        thinking "who's already here" vs. "who do I bring in" cares more
+        about that distinction than the reserve/day-off split underneath it.
         """
         if self.deadhead:
             return "deadhead_reposition"
@@ -264,9 +265,9 @@ STRATEGY_LABELS: dict[str, str] = {
     "cancel": "Cancel",
 }
 """The four strategies `find_options` ranks across, in the fixed order a
-controller should read them: two ways to staff from people already at or near
-base, one way to bring someone in from elsewhere, and the fallback none of
-the other three should usually beat."""
+controller should read them: two ways to staff from people already at or
+near base, one way to bring someone in from elsewhere, and the fallback
+none of the other three should usually beat."""
 
 
 def resilience_score(world: World, candidate: Candidate, role: str, base: str,
@@ -277,9 +278,9 @@ def resilience_score(world: World, candidate: Candidate, role: str, base: str,
     A day-off callout never touches the on-call reserve pool, so it scores
     100 regardless of how thin that pool is. A reserve callout consumes one
     of `n` currently-on-call crew of this rank at this base, scoring
-    100*(n-1)/n -- thinner pools cost more resilience per reserve used, which
-    is the point: using the only reserve captain at a station should read as
-    a bigger hit than using one of twelve.
+    100*(n-1)/n. Thinner pools cost more resilience per reserve used — that's
+    the point: using the only reserve captain at a station should read as a
+    bigger hit than using one of twelve.
     """
     if not candidate.on_reserve:
         return 100.0
@@ -317,12 +318,13 @@ def assess(world: World, crew_id: str, pairing_id: str,
     """Evaluate one crew member against one pairing.
 
     `extra_assigned` is for commitments made *after* the vendored dataset
-    was generated -- a crew member committed live, via `commit_decision`, to
-    a different pairing (see `core_engine/ledger.py`). It is merged into a
-    *copy* of the snapshot for this call only, so a decision made in one
-    disruption is honoured by `RULE-REST-04`'s existing overlap/double-
+    was generated — a crew member committed live, via `commit_decision`, to
+    a different pairing (see `core_engine/ledger.py`). It's merged into a
+    *copy* of the snapshot for this call only. That way a decision made in
+    one disruption is honoured by `RULE-REST-04`'s existing overlap/double-
     booking check for every other pairing evaluated afterwards, without a
-    second, parallel exclusivity check to keep in sync with the first.
+    second, parallel exclusivity check that would have to be kept in sync
+    with the first.
     """
     crew = world.crew.get(crew_id)
     if crew is None:
@@ -342,14 +344,24 @@ def assess(world: World, crew_id: str, pairing_id: str,
             return Candidate(crew_id, verdicts, False, True, 0.0, 0, {})
         slip = max(slip, needed)
 
-    shifted = [d.delayed(slip) if slip else d for d in days]
+    # Positioning shifts the whole day later (report and release together —
+    # the day itself isn't any longer, it just starts later). An actual
+    # delay stretches the day instead (release only), since that's what can
+    # push a duty period past its FDP limit. `slip` conflates the two
+    # amounts when both apply, but `deadhead` alone decides which transform
+    # is used here — that matches the one case (positioning) `slip` can
+    # actually come from when `deadhead` is true.
+    if slip:
+        shifted = [(d.shifted(slip) if deadhead else d.delayed(slip)) for d in days]
+    else:
+        shifted = list(days)
     on_reserve = world.on_reserve(crew_id, first.date, shifted[0].report_utc)
     verdicts = rules.evaluate(crew, shifted, exclude_pairing=pairing_id, deadhead=deadhead)
 
-    # Rostered on reserve that day, but the window does not cover the required
-    # report: they are unavailable, not a day-off callout. Someone on reserve
-    # duty is not on a day off, so falling back to day-off pricing invents an
-    # option the desk does not actually have.
+    # Rostered on reserve that day, but the window doesn't cover the required
+    # report: they're unavailable, not a day-off callout. Someone on reserve
+    # duty isn't on a day off, so falling back to day-off pricing would
+    # invent an option the desk doesn't actually have.
     rostered_reserve = any(d == first.date for d, _, _ in world.reserves.get(crew_id, ()))
     if rostered_reserve and not on_reserve:
         window = next(

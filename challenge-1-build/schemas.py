@@ -1,12 +1,12 @@
 """Typed answer objects.
 
-The agent builds one of these and prose is rendered *from* it — never the
-other way round, which is what lets the deterministic renderer in
+The agent builds one of these, and prose is rendered *from* it, never the
+other way round. That's what lets the deterministic renderer in
 `explainer.py` and the trust gate in `verifier.py` both work off one object.
 
 `Option` keeps its field names stable (`action`, `crew_id`, `legal`,
 `rules_checked`, `cost_inr`, `delay_hours`, `rank`) because they mirror the
-crew-ops-advisor-dataset's own scenario answer keys — fields may be added,
+crew-ops-advisor-dataset's own scenario answer keys. Fields may be added,
 but not renamed, without breaking evaluation against `data/scenarios.json`.
 """
 
@@ -104,9 +104,9 @@ class RuleVerdict:
 
     @property
     def failed(self) -> bool:
-        """Compare by value, not identity — `status` may arrive as the plain
-        string "FAIL" once it has crossed a tool-call JSON boundary, and `is`
-        returns False for that."""
+        """Compare by value, not identity. `status` may arrive as the plain
+        string "FAIL" once it has crossed a tool-call JSON boundary, and
+        `is` returns False for that."""
         return str(self.status) == str(Verdict.FAIL)
 
 
@@ -224,9 +224,10 @@ class ReplacementAnswer:
     strategies: list[Option] = field(default_factory=list)
     """A policy-backed ranking across the four strategies a controller
     actually chooses between (reserve callout, day-off callout, deadhead/
-    reposition, cancel) — one representative each, cheapest legal candidate
-    per strategy, cancel always last. `options` above still carries every
-    individual legal candidate; this is the four-line executive summary."""
+    reposition, cancel): one representative each, the cheapest legal
+    candidate per strategy, cancel always last. `options` above still
+    carries every individual legal candidate; this is the four-line
+    executive summary."""
     near_misses: list[Option] = field(default_factory=list)
     excluded: list[dict[str, Any]] = field(default_factory=list)
     subject_name: str = ""

@@ -72,7 +72,7 @@ needs no action. Two things are worth doing explicitly before Challenge 1:
 
 No code change is required for this layer — it runs before a request
 reaches the model and after a response leaves it, entirely inside Azure. It
-sits *alongside* this system's other two guardrails, not in place of them:
+sits alongside this system's other two guardrails, not in place of them:
 
 | Layer | Catches | Where |
 |---|---|---|

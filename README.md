@@ -1,10 +1,9 @@
-# 🛫 Crew Ops Advisor — Microsoft Agent-a-thon Submission
+# Crew Ops Advisor — Microsoft Agent-a-thon Submission
 
-A Microsoft Foundry hands-on lab, structured the way this hackathon's own
-sample labs are, built around a real system: an AI advisor for an airline
-crew-control desk that turns "Captain C-1042 just called in sick for P-2291,
-who do I use?" into a legally-verified, cost-ranked, cited answer in seconds
-— never a plausible-sounding guess.
+A Microsoft Foundry hands-on lab built around a real system: an AI advisor
+for an airline crew-control desk that turns "Captain C-1042 just called in
+sick for P-2291, who do I use?" into a legally-verified, cost-ranked, cited
+answer — never a plausible-sounding guess.
 
 ## Background
 
@@ -27,7 +26,7 @@ domain a hallucination is a real person dispatched to the wrong aircraft.
 Build a Microsoft Foundry agent system that:
 
 1. **Routes** a question to the right kind of answer (mostly for free, via
-   regex — a model is only asked when the pattern rules genuinely don't know)
+   regex and a semantic fallback — a model is only asked when both abstain)
 2. **Resolves** it using tools backed by a real legality engine — 7 duty/rest/
    qualification/certification rules, a cost model, and cost-ranked candidate
    search — never by the model's own arithmetic
@@ -40,7 +39,7 @@ Build a Microsoft Foundry agent system that:
 | # | Challenge | What You'll Do | Time |
 |---|-----------|-----------------|------|
 | 0 | [Setup](./challenge-0-setup/README.md) | Deploy Microsoft Foundry infrastructure | 20 min |
-| 1 | [Build Agents](./challenge-1-build/README.md) | Build the Triage, Resolution Advisor (10 tools) and Explainer agents | 45 min |
+| 1 | [Build Agents](./challenge-1-build/README.md) | Build the Triage, Resolution Advisor (15 tools) and Explainer agents | 45 min |
 | 2 | [Monitor](./challenge-2-monitor/README.md) | Enable GenAI tracing with Application Insights | 20 min |
 | 3 | [Evaluate](./challenge-3-evaluate/README.md) | Run systematic quality evaluations | 30 min |
 | 4 | [Production Workflow](./challenge-4-deploy/README.md) | Multi-agent orchestration + portal workflow | 30 min |
@@ -48,22 +47,18 @@ Build a Microsoft Foundry agent system that:
 
 ## Why three agents, not two
 
-Every other scenario built on this lab template ships two agents: a
-tool-using detector and a pure-reasoning advisor. This one ships three,
-because that is the actual shape of the problem, not because more agents is
-better. The system this lab is based on — dCortex Crew Ops Advisor — is
-explicit that it rejected a heavier multi-agent decomposition (a legality
-agent, a cost agent, a cascade agent, a coordinator) as pure overhead: all of
-that reasoning is deterministic and exact, so having models confer about it
-would only add latency, not correctness. What it kept is three points where a
-language model call earns its place — classify, choose-tools-and-narrate,
-rewrite-for-a-human — and this lab reproduces exactly that, mapped onto
-Foundry's `PromptAgentDefinition` pattern:
+The system this lab is based on — dCortex Crew Ops Advisor — rejected a
+heavier multi-agent decomposition (a legality agent, a cost agent, a cascade
+agent, a coordinator) as pure overhead: that reasoning is deterministic and
+exact, so having models confer about it would only add latency, not
+correctness. What earns a model call is three things — classify,
+choose-tools-and-narrate, rewrite-for-a-human — mapped onto Foundry's
+`PromptAgentDefinition` pattern:
 
 | Agent | Tools | Job |
 |---|---|---|
-| **Triage** | none | Classify tier/intent, only when regex rules abstain |
-| **Resolution Advisor** | **10** | Choose tools, never calculate; the only agent touching the legality engine |
+| **Triage** | none | Classify tier/intent, only when the regex router and its semantic fallback both abstain |
+| **Resolution Advisor** | **15** | Choose tools, never calculate; the only agent touching the legality engine |
 | **Explainer** | none | Rewrite a verified template into prose; never adds a fact |
 
 ## Why the Challenges Are in This Order
@@ -71,7 +66,7 @@ Foundry's `PromptAgentDefinition` pattern:
 **Build first.** An agent reasoning from general knowledge about "typical"
 crew rest rules will produce a plausible, wrong answer — the FDP limit here
 shrinks 0.5h per sector past the second, and no model knows that without a
-tool telling it. `check_legality` and the other nine tools ground every
+tool telling it. `check_legality` and the other fourteen tools ground every
 answer in `core_engine/`'s ported rules engine, not in what "usually" is true
 of airline rosters.
 
@@ -95,8 +90,13 @@ between a demo and something a crew-control desk could actually run against.
 Controller's question
         │
         ▼
-   ROUTER (regex, ~20 rules, 0 model calls)
-        │  abstains?
+   ROUTER (router.py, 21 ordered regex rules, 0 model calls)
+        │  every rule abstains?
+        ▼
+   SEMANTIC FALLBACK (hybrid BM25 + embedding match against the 38 gold
+   questions, 0.65 threshold, 0 model calls) ── borrows the closest match's
+   intent, never its entities or its answer
+        │  no match clears the threshold?
         ▼
   TRIAGE AGENT (Foundry, no tools) ── classifies intent
         │
@@ -104,23 +104,33 @@ Controller's question
   PLANNER (pipeline.py, 0 model calls) ── seeds the obvious opening tool calls
         │
         ▼
-  RESOLUTION ADVISOR AGENT (Foundry, 10 tools)
+  RESOLUTION ADVISOR AGENT (Foundry, 15 tools)
         │   lookup · notification_brief · duty_clock · check_legality
-        │   find_options · ripple · simulate · joint_plan · check_gate
-        │   explain_rule
+        │   find_options · ripple · simulate · joint_plan · same_pairing
+        │   check_gate · explain_rule · search_rules · suggest_crew_ids
+        │   list_controllers · controller_issue_counts
         │        │
         │        ▼
         │   core_engine/  ── 7 legality rules, duty arithmetic, cost model,
-        │                    candidate search, boarding-gate occupancy
+        │                    candidate search, boarding-gate occupancy,
+        │                    hybrid search over rules/questions/scenarios
         ▼
-  VERIFIER (verifier.py, 0 model calls) ── every claim traced to a tool call?
-        │  no → discard draft, ship the deterministic template instead
+  VERIFIER (verifier.py, 0 model calls) ── every claim traced to a tool
+        │  call, plus hallucination and completeness checks (invented crew
+        │  names, malformed flight numbers, miscounted lists, dropped
+        │  "excluded"/"uncovered" entries)
+        │  fails → discard draft, ship the deterministic template instead
         ▼
   EXPLAINER AGENT (Foundry, no tools) ── verified answer -> controller prose
         │
         ▼
   Cited, cost-ranked, legally-checked answer
 ```
+
+A sixteenth tool, `commit_decision`, exists for the [Console](./console/README.md)'s
+ledger writes but is deliberately withheld from the Resolution Advisor's own
+tool loop — an agent only narrates and recommends, it never commits a crew
+member on its own.
 
 ## Guardrails
 

@@ -6,9 +6,9 @@ Time: ~45 minutes
 
 By the end of this challenge, you will have:
 
-- ✅ A **Triage Agent** that classifies a controller's question when regex
-  rules can't (no tools)
-- ✅ A **Resolution Advisor Agent** wired to all **10** real crew-ops tools —
+- ✅ A **Triage Agent** that classifies a controller's question when the
+  router can't (no tools)
+- ✅ A **Resolution Advisor Agent** wired to **15** real crew-ops tools —
   the only agent that ever touches the legality engine
 - ✅ An **Explainer Agent** that rewrites a verified answer into controller
   prose (no tools — pure reasoning)
@@ -33,14 +33,17 @@ Every number, id and legality verdict has to come from a tool call into
 arithmetic, cost model and candidate search. A deterministic **verifier**
 (`verifier.py`) checks every claim in the final answer against what the tools
 actually returned, and rejects anything unsourced. That is why this scenario
-ships **three** agents and **ten** tools instead of the two-agent,
+ships **three** agents and **fifteen** tools instead of the two-agent,
 one-tool shape used elsewhere in this repo: the number follows from the
 problem, not from the template.
 
 ## The pipeline
 
 ```
-ROUTER (regex, 0 model calls) ──▶ TRIAGE AGENT (only if the router abstains)
+ROUTER (router.py: 21 regex rules, then a semantic fallback, 0 model calls)
+        │
+        ▼
+TRIAGE AGENT (only if the router abstains)
         │
         ▼
 PLANNER — pipeline.py's seed_calls() (0 model calls, pure Python)
@@ -49,16 +52,27 @@ PLANNER — pipeline.py's seed_calls() (0 model calls, pure Python)
 RESOLUTION ADVISOR AGENT — the tool loop (1..8 model calls, 15 tools)
         │
         ▼
-VERIFIER — verifier.py (0 model calls, set-membership over the tool trace)
+VERIFIER — verifier.py (0 model calls, trace-sourcing + hallucination +
+           completeness checks)
         │
         ▼
 EXPLAINER AGENT — rewrites the verified template into prose (0-1 model calls)
 ```
 
-`router.py` runs ~20 ordered regex rules first — every one of the dataset's
-38 gold questions routes with zero model calls. Only when every rule abstains
-does the **Triage Agent** get consulted, and even then it only classifies
-*which kind* of question this is; it never touches a tool.
+`router.py` tries three stages, in order, before spending a model call:
+
+1. **21 ordered regex rules** (`RULES` in `router.py`) — every one of the
+   dataset's 38 gold questions routes here with zero model calls.
+2. **A semantic fallback** (`route_semantic`) — hybrid BM25 + embedding
+   search against the 38 gold questions (`core_engine/intent_search.py`).
+   A question phrased in a way no regex anticipated borrows the closest
+   match's *intent* (never its entities or its answer) if the blended score
+   clears 0.65. Only active when `LEDGER_DATABASE_URL` and
+   `EMBEDDING_MODEL_DEPLOYMENT_NAME` are set; otherwise this stage is
+   skipped.
+3. **The Triage Agent** — reached only when both of the above abstain. It
+   only classifies *which kind* of question this is; it never touches a
+   tool.
 
 ## Agents and Tools
 
@@ -71,22 +85,29 @@ model deployment (`TRIAGE_MODEL_DEPLOYMENT_NAME` in `.env`, optional).
 
 ### Resolution Advisor Agent — `agents.py::ResolutionAdvisorAgent`
 
-The only agent with tools — all **ten** of them, defined once as
-vendor-neutral JSON Schema in `tools.py::TOOL_SCHEMAS` and adapted into
-`FunctionTool` objects by `tools.py::foundry_tools()`:
+The only agent with tools — **15** of them, defined once as vendor-neutral
+JSON Schema in `tools.py::TOOL_SCHEMAS` and adapted into `FunctionTool`
+objects by `tools.py::foundry_tools()`. (`TOOL_SCHEMAS` actually holds 16 —
+`commit_decision` is reserved for the [Console](../console/README.md)'s
+ledger writes and is withheld from the Advisor's own tool loop.)
 
 | # | Tool | What it does |
 |---|------|---------------|
-| 1 | `lookup` | Row retrieval across 10 entities — crew, flights, pairings, reserves, certifications, risk signals... |
+| 1 | `lookup` | Row retrieval across 10 entities — crew, flights, pairings, reserves, certifications, risk signals... — with optional `sort_by`/`limit`/`group_by` so counting and min/max never happen in prose |
 | 2 | `notification_brief` | Every fact a callout message needs, read from the roster |
 | 3 | `duty_clock` | Accrued duty/flight hours and headroom under RULE-DUTY-02 / RULE-FLT-03 |
 | 4 | `check_legality` | Evaluate all **7 rules** for one crew member against one pairing |
-| 5 | `find_options` | Every legal candidate, cost-ranked, **plus** a policy-backed summary across the four strategies (reserve callout, day-off callout, deadhead/reposition, cancel — cheapest of each, cancel always last) |
-| 6 | `ripple` | Blast radius of a disruption: uncovered flights, at-risk downstream days, passengers |
+| 5 | `find_options` | Every legal candidate, cost-ranked, **plus** a policy-backed summary across four strategies (reserve callout, day-off callout, deadhead/reposition, cancel — cheapest of each, cancel always last) |
+| 6 | `ripple` | Blast radius of a disruption, named as a pairing, crew id, flight, station-closure window, or aircraft tail: uncovered flights, at-risk downstream days, passengers |
 | 7 | `simulate` | Fork the world, apply a what-if, return the diff |
 | 8 | `joint_plan` | Cost-minimal assignment across simultaneous disruptions (disjoint — one crew member, one pairing) |
-| 9 | `check_gate` | Verify or inspect a boarding-gate assignment (bonus tool) |
-| 10 | `explain_rule` | The text and parameters of one rule |
+| 9 | `same_pairing` | Whether two crew members share a pairing this week |
+| 10 | `check_gate` | Verify or inspect a boarding-gate assignment |
+| 11 | `explain_rule` | The text and parameters of one rule, by id |
+| 12 | `search_rules` | Hybrid search over the 7 rules, for a paraphrased legality question that names no rule id |
+| 13 | `suggest_crew_ids` | Real crew ids closest to a malformed one, for a "did you mean?" instead of a guess |
+| 14 | `list_controllers` | The controller desks working this operation, and which aircraft each covers |
+| 15 | `controller_issue_counts` | Open disruption count per controller desk, from the live ledger |
 
 Every tool is backed by `core_engine/` — a JSON-dataset port of the original
 project's Postgres-backed rules engine:
@@ -95,15 +116,21 @@ project's Postgres-backed rules engine:
   through `RULE-BASE-07`), each returning *why*, never a bare boolean
 - **`core_engine/duty.py`** — calendar-day duty windows and the sector-count-
   dependent FDP limit
-- **`core_engine/world.py`** — candidate search and cost ranking (`assess()`,
-  `find_options`'s pool-and-rank logic)
+- **`core_engine/world.py`** / **`port.py`** — candidate search and cost
+  ranking (`assess()`, `find_options`'s pool-and-rank and policy logic)
 - **`core_engine/gates.py`**, **`core_engine/resolve.py`** — boarding-gate
   occupancy, and "did you mean?" id resolution that never auto-corrects
+- **`core_engine/embeddings.py`**, **`rule_search.py`**, **`intent_search.py`**,
+  **`scenario_search.py`** — the hybrid BM25 + embedding search layer behind
+  `search_rules`, the router's semantic fallback, and scenario classification.
+  All optional: only active with `LEDGER_DATABASE_URL` and
+  `EMBEDDING_MODEL_DEPLOYMENT_NAME` set; the rest of the pipeline works
+  without them.
 
 `agents.py::ResolutionAdvisorAgent.run_intent()` seeds the obvious opening
 tool calls deterministically (`pipeline.py::seed_calls()`) before the model
 is even consulted, then runs the standard Foundry function-call loop —
-capped at 8 iterations — for anything more it needs.
+capped at `config.MAX_TOOL_ITERATIONS` (8) — for anything more it needs.
 
 ### Explainer Agent — `agents.py::ExplainerAgent`
 
@@ -119,7 +146,10 @@ draft is discarded and the deterministic template ships instead.
 Three independent layers, none of which knows about the other two:
 
 - **`verifier.py`** — deterministic, runs on every answer. Rejects anything
-  claiming a number or id no tool call in the trace actually returned.
+  claiming a number or id no tool call in the trace actually returned, plus
+  targeted hallucination checks (an invented crew name, a malformed flight
+  number, a mismatched count) and completeness checks (an `excluded` or
+  `uncovered_flights` entry the prose silently dropped).
 - **`pii.py`** — deterministic, runs at the output boundary
   (`agents.py::print_response()`). Redacts email/phone/PAN/passport/Aadhaar/
   card numbers by content pattern, and address/DOB/health/financial fields by

@@ -1,13 +1,13 @@
 """Hybrid (BM25 + semantic) search over the 38 gold questions, for a
-question phrased in a way none of router.py's ~20 regex rules anticipated
--- "is captain A Nair available?" rather than "who is qualified as
-captain" or "is C-1042 legal to cover P-2291". Every regex added for one
-new phrasing just gets followed by the next one; matching against real,
-already-answered example questions generalises instead of enumerating.
+question phrased in a way none of router.py's ~20 regex rules anticipated —
+"is captain A Nair available?" rather than "who is qualified as captain" or
+"is C-1042 legal to cover P-2291". Every regex added for one new phrasing
+just gets followed by the next one; matching against real, already-answered
+example questions generalises instead of enumerating.
 
 Knows nothing about `Intent`/`Route`/router.py on purpose, to avoid a
 circular import (router.py needs to call this; this must not need
-router.py) -- it only finds the closest example question. The caller
+router.py). It only finds the closest example question. The caller
 (router.py) is responsible for turning "this most resembles Q07" into an
 actual intent, since only it has the deterministic classifications to map
 question ids onto.
@@ -31,8 +31,8 @@ def enabled() -> bool:
 
 def best_matches(query: str, top_k: int = 3, alpha: float = 0.5) -> list[dict[str, Any]]:
     """The `top_k` gold questions closest to `query`, each with its own
-    `question_id`, `tier`, and `blended_score`. `[]` if unconfigured --
-    the caller treats that exactly like "no match found", not an error."""
+    `question_id`, `tier`, and `blended_score`. Returns `[]` if unconfigured,
+    and the caller treats that exactly like "no match found", not an error."""
     if not enabled():
         return []
 

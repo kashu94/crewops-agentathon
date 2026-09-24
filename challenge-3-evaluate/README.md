@@ -35,14 +35,16 @@ and id in it actually came from a tool call. A fluent, coherent, wrong answer
 passes both evaluators here and is still rejected by the verifier before it
 ever reaches a controller.
 
-`eval_portal.jsonl` holds a 12-question cross-tier sample in the flattened
+`eval_portal.jsonl` holds a 12-question cross-tier sample, and
+`eval_portal_full38.jsonl` all 38, both in the flattened
 `{"query": ..., "ground_truth": ...}` shape the Foundry portal's dataset
-upload expects.
+upload expects. Start with the 12-question sample; switch to the full 38 once
+that runs cleanly.
 
 ## Get Started
 
 1. In the **Foundry portal** → your project → **Evaluation** → **Datasets**,
-   upload `eval_portal.jsonl`.
+   upload `eval_portal.jsonl` (or `eval_portal_full38.jsonl` for the full set).
 
 2. Create a new evaluation run against the **Resolution Advisor Agent**
    (`crew-resolution-advisor-agent`), selecting the **Coherence** and

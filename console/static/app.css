@@ -65,10 +65,10 @@ body {
 
 /* Fixed height, not min-height: with min-height, a tall page (a long
    disruption detail view) stretches the whole flex row taller than the
-   viewport, so the sidebar -- just another flex child -- scrolls away with
-   it instead of staying put. Pinning `.shell` to exactly 100vh and letting
-   `.content` (not `.main` as a whole) be the one scrollable region inside
-   it is what actually keeps the sidebar and topbar fixed. */
+   viewport, so the sidebar -- just another flex child -- scrolls away
+   with it instead of staying put. Pinning `.shell` to exactly 100vh, and
+   making `.content` (not all of `.main`) the one scrollable region, is
+   what keeps the sidebar and topbar fixed. */
 .shell { display: flex; height: 100vh; }
 
 .sidebar {
@@ -190,9 +190,8 @@ h2 { font-size: 16px; margin: 0 0 12px; }
 }
 /* Balanced is always green -- it's the platform's own recommendation, a
    fixed fact about the disruption. A controller's own pick, when it isn't
-   Balanced, gets a separate, distinctly non-green marker so the two can
-   never be confused with each other, including when they happen to name
-   the same crew member. */
+   Balanced, gets a separate, clearly non-green marker, so the two can
+   never be confused even when they name the same crew member. */
 .policy-card.recommended { border-color: var(--accent); background: var(--accent-soft); }
 .policy-card.recommended .check { color: var(--accent); }
 .policy-card.chosen { border-color: #3b4bb0; background: #eef0fb; }

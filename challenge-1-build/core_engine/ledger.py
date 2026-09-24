@@ -1,23 +1,23 @@
 """Cross-disruption state: which disruptions are open, who they're
-considering, and what's been committed -- the one piece of this system that
-needs to be shared across controllers and processes, because every other
-tool call is a pure function of the static roster.
+considering, and what's been committed. This is the one piece of this
+system that needs to be shared across controllers and processes, since
+every other tool call is a pure function of the static roster.
 
-Feature-gated on `LEDGER_DATABASE_URL`. Unset, every function below is a
-no-op and `find_options`/`commit_decision` behave exactly as they did before
-this file existed -- so every existing test keeps passing with no database
-configured.
+Feature-gated on `LEDGER_DATABASE_URL`. Left unset, every function below is
+a no-op, and `find_options`/`commit_decision` behave exactly as they did
+before this file existed — so every existing test keeps passing with no
+database configured.
 
 Two new tables (`open_disruptions`, `open_disruption_candidates`) hold what
 this repo's own dataset has no place for: the live set of disruptions being
-worked right now, and who's a legal candidate for each at the moment it was
-last computed. A committed decision does NOT go into a third table --
-it's written straight into the same `pairing_crew` table the rest of this
-schema already uses to mean "this crew member is assigned to this pairing",
-and logged to the existing `controller_decisions` audit table. That is
+worked right now, and who's a legal candidate for each, as of when that was
+last computed. A committed decision does NOT go into a third table — it's
+written straight into the same `pairing_crew` table the rest of this schema
+already uses to mean "this crew member is assigned to this pairing", and
+logged to the existing `controller_decisions` audit table. That's
 deliberate: it means a commitment is honoured by `RULE-REST-04`'s existing
 double-booking check for every pairing evaluated afterwards (see
-`core_engine.world.assess`'s `extra_assigned` parameter), rather than by a
+`core_engine.world.assess`'s `extra_assigned` parameter), instead of by a
 second, bespoke exclusivity rule that could drift out of sync with the
 first.
 """
@@ -91,15 +91,15 @@ def register_and_check_contention(
 ) -> dict[str, list[dict[str, Any]]]:
     """`open_disruption()` then `contention_for()`, on one connection instead
     of two. Same cross-region-latency reasoning as `live_assignments_bulk`:
-    every `_conn()` call is a fresh TLS handshake to Neon, and `find_options`
-    otherwise pays for three of them on every single page load."""
+    every `_conn()` call is a fresh TLS handshake to Neon, and without this,
+    `find_options` would pay for three of them on every single page load."""
     if not enabled():
         return {}
     crew_ids = [c["crew_id"] for c in candidates]
 
     with _conn() as conn:
-        # `opened_by` refreshes on every view like the other columns do --
-        # the contention message ("also wanted by X's desk") should name
+        # `opened_by` refreshes on every view like the other columns do.
+        # The contention message ("also wanted by X's desk") should name
         # whoever most recently has eyes on it, not whoever happened to
         # view it first. The `CASE` guards against the one way that could
         # regress: server.py's own `"unknown"` fallback for a request with
@@ -154,7 +154,7 @@ def register_and_check_contention(
 
 def recent_decisions(limit: int = 50) -> list[dict[str, Any]]:
     """The last `limit` rows of the schema's own `controller_decisions`
-    audit table -- every commit this console makes lands here, alongside
+    audit table. Every commit this console makes lands here, alongside
     anything the reference app itself has ever written to it."""
     if not enabled():
         return []
@@ -200,15 +200,15 @@ def list_open_disruptions() -> list[dict[str, Any]]:
 
 def live_assignments_for(crew_id: str, exclude_pairing: str) -> list[str]:
     """Every OTHER pairing this crew member is live-committed to in
-    `pairing_crew`, beyond the exclude_pairing. Real duty-window overlap is
-    then checked by the caller using the local dataset's own `duty_days`,
-    since the two share the identical dataset.
+    `pairing_crew`, beyond the exclude_pairing. The caller then checks real
+    duty-window overlap using the local dataset's own `duty_days`, since the
+    two share the identical dataset.
 
     This includes both the ~206 rows the vendored dataset shipped with and
-    any row a console commit has since added -- `commitment_for()` is what
-    tells the two apart, for the caller that needs to know whether a
-    conflict is "this is their base schedule" or "another controller just
-    took them"."""
+    any row a console commit has since added. `commitment_for()` is what
+    tells the two apart, for a caller that needs to know whether a conflict
+    is "this is their base schedule" or "another controller just took
+    them"."""
     if not enabled():
         return []
     with _conn() as conn:
@@ -225,11 +225,11 @@ def live_assignments_bulk(crew_ids: list[str], exclude_pairing: str) -> dict[str
     `find_options`'s candidate pool in one round trip instead of one per
     candidate.
 
-    That N+1 pattern is not a micro-optimisation to skip: with ~20-30
-    candidates per role, one fresh TLS connection per candidate to a
+    Avoiding that N+1 pattern is not a micro-optimisation to skip: with
+    ~20-30 candidates per role, one fresh TLS connection per candidate to a
     cross-region Postgres instance measured at 10+ seconds for a single page
-    load -- long enough that a controller clicking "Approve" reasonably
-    concludes the button does nothing. This is the one query that matters.
+    load — long enough that a controller clicking "Approve" would reasonably
+    conclude the button does nothing. This is the one query that matters.
     """
     if not enabled() or not crew_ids:
         return {}
@@ -248,8 +248,8 @@ def live_assignments_bulk(crew_ids: list[str], exclude_pairing: str) -> dict[str
 
 def commitment_for(pairing_id: str) -> dict[str, Any] | None:
     """Who committed which crew member to `pairing_id` via this console, if
-    anyone -- `None` for a pairing whose crew is only ever the vendored
-    dataset's own original assignment, which nobody "took"."""
+    anyone. Returns `None` for a pairing whose crew is only ever the
+    vendored dataset's own original assignment, which nobody "took"."""
     if not enabled():
         return None
     with _conn() as conn:
@@ -278,10 +278,11 @@ def commitment_for(pairing_id: str) -> dict[str, Any] | None:
 
 def commitments_bulk(pairing_ids: list[str]) -> dict[str, dict[str, Any]]:
     """`commitment_for()` for every pairing_id in `find_options`'s excluded
-    list in one round trip. The single-pairing version above is for the one
-    genuinely single-lookup case (`commit_decision`'s own re-check); calling
-    it once per excluded candidate is the identical N+1 mistake
-    `live_assignments_bulk` exists to avoid, just one call site over."""
+    list, in one round trip. The single-pairing version above is for the
+    one genuinely single-lookup case (`commit_decision`'s own re-check).
+    Calling it once per excluded candidate would repeat the same N+1
+    mistake `live_assignments_bulk` exists to avoid, just at a different
+    call site."""
     if not enabled() or not pairing_ids:
         return {}
     with _conn() as conn:
@@ -327,16 +328,16 @@ def _write_commitment(cur: Any, disruption_id: str, pairing_id: str, crew_id: st
                        presented_options: list[dict[str, Any]],
                        override_reason: str | None = None) -> None:
     """One assignment's writes, using a cursor the caller already opened a
-    transaction on -- shared by `commit_decision` (one assignment, one
+    transaction on. Shared by `commit_decision` (one assignment, one
     transaction) and `commit_joint` (several assignments, one transaction),
     so the two can never drift into writing different things for the same
     kind of commitment.
 
     `override_reason` is only ever set when the controller picked something
-    other than the Balanced recommendation (see tools.py's `commit_decision`)
-    -- it goes into `controller_decisions.override_reason`, a column this
-    schema already had before this console existed, so this reuses it rather
-    than inventing a parallel place to say the same thing."""
+    other than the Balanced recommendation (see tools.py's `commit_decision`).
+    It goes into `controller_decisions.override_reason`, a column this
+    schema already had before this console existed, so this reuses it
+    instead of inventing a parallel place to say the same thing."""
     cur.execute(
         """INSERT INTO pairing_crew (pairing_id, crew_id, role)
            VALUES (%s, %s, %s)
@@ -351,8 +352,8 @@ def _write_commitment(cur: Any, disruption_id: str, pairing_id: str, crew_id: st
         (disruption_id, "accepted_option", accepted_rank,
          json.dumps(presented_options, default=_json_default), override_reason),
     )
-    # Upsert, not a bare UPDATE: if this disruption was never independently
-    # viewed (so `open_disruption()` never registered it -- e.g. it was only
+    # Upsert, not a bare UPDATE. If this disruption was never independently
+    # viewed (so `open_disruption()` never registered it — e.g. it was only
     # ever seen as one leg of a joint plan, keyed internally by pairing_id;
     # see `core_engine.port.JsonToolPort.joint_plan`), an UPDATE alone would
     # silently match zero rows here, and a *later* view of it would then
@@ -384,8 +385,8 @@ def commit_decision(disruption_id: str, pairing_id: str, crew_id: str, role: str
     """Write a real roster assignment (`pairing_crew`) and a real audit row
     (`controller_decisions`, the schema's own existing table for this), then
     close the disruption. The caller (`tools.py::commit_decision`) has
-    already re-checked legality against the live state immediately before
-    calling this -- this function does not re-check, it commits."""
+    already re-checked legality against the live state right before calling
+    this — this function doesn't re-check, it just commits."""
     if not enabled():
         raise CommitError("LEDGER_DATABASE_URL is not set; nothing to commit to.")
 
@@ -401,11 +402,11 @@ def commit_joint(assignments: list[dict[str, Any]], committed_by: str) -> None:
     """Every assignment in a joint plan, in one transaction: all of them
     land or none do. "One approval, one transaction" is the whole point of
     coordinating a joint plan instead of letting each pairing commit
-    independently -- a plan where two of three legs succeeded and the third
-    lost a race to another desk is not a plan, it is a new problem. Legality
+    independently. A plan where two of three legs succeeded and the third
+    lost a race to another desk isn't a plan, it's a new problem. Legality
     for every assignment must already be re-checked by the caller before
-    this is called (see `core_engine.port.JsonToolPort.commit_joint_decisions`)
-    -- this function only writes."""
+    this is called (see `core_engine.port.JsonToolPort.commit_joint_decisions`).
+    This function only writes."""
     if not enabled():
         raise CommitError("LEDGER_DATABASE_URL is not set; nothing to commit to.")
 

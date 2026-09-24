@@ -5,15 +5,15 @@ Resolution Advisor Agent above it may only *choose* tools and *narrate* what
 they return. It never computes a duty hour or a cost itself.
 
 Tools are coarse and semantically meaningful rather than micro-CRUD, so a
-tier-2 question is three calls rather than thirty. There are fifteen of
+tier-2 question takes three calls instead of thirty. There are fifteen of
 them — `TOOL_SCHEMAS` below is the exact list, in vendor-neutral JSON Schema.
 `foundry_tools()` adapts that list into `azure.ai.projects.models.FunctionTool`
 objects for `PromptAgentDefinition(tools=...)`.
 
-`JsonToolPort` (in `core_engine/port.py`) is the one implementation: it
+`JsonToolPort` (in `core_engine/port.py`) is the one implementation. It
 satisfies `ToolPort` by computing answers from the vendored dataset in
-`data/` rather than replaying fixtures, so it works for any pairing rather
-than only the ones with a published answer key.
+`data/`, instead of replaying fixtures, so it works for any pairing, not
+just the ones with a published answer key.
 """
 
 from __future__ import annotations
@@ -33,7 +33,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "lookup",
         "description": (
             "Retrieve rows from the operational dataset. The tier-1 workhorse: "
-            "crew, flights, pairings, reserves, certifications, risk signals."
+            "crew, flights, pairings, reserves, certifications, risk signals. "
+            "For 'how many X are Y' or 'how many of those are Z' -- filter on "
+            "every dimension in ONE call (they combine as AND) and take "
+            "len(rows) of the result. Do not filter on only some dimensions "
+            "and then count the rest by eye across the returned rows; that is "
+            "where a real count like 'ATR-rated captains at BLR' goes wrong."
         ),
         "input_schema": {
             "type": "object",
@@ -50,10 +55,58 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "object",
                     "description": (
                         "Field filters, e.g. {'base': 'BLR', 'rank': 'Captain'}. "
-                        "Dates are ISO-8601. A value may instead be a range, "
+                        "A list-valued field (e.g. crew.ratings) matches by "
+                        "containment -- {'ratings': 'ATR72'} finds every "
+                        "captain who HAS that rating among possibly several, "
+                        "not just crew whose ratings list equals it exactly. "
+                        "For entity pairing_crew/pairing_days/pairings, "
+                        "'aircraft'+'date' together (e.g. 'the Senior Cabin "
+                        "Crew on VT-DXB's pairing on 2026-09-16') resolve to "
+                        "the right pairing_id for you -- neither entity has "
+                        "an aircraft or date field to filter on directly, so "
+                        "pass aircraft+date as filters rather than first "
+                        "calling lookup(pairings, {aircraft}) and inspecting "
+                        "the nested days yourself. Dates are ISO-8601. A "
+                        "value may instead be a range, "
                         "e.g. {'valid_to': {'gte': '2026-09-15', "
                         "'lte': '2026-10-15'}} for 'expiring within 30 days of "
                         "15 Sep'. Operators: gte, lte, gt, lt."
+                    ),
+                },
+                "sort_by": {
+                    "type": "string",
+                    "description": (
+                        "For 'the fastest/highest/lowest X' or 'top N by X' "
+                        "questions: the field to sort by (e.g. "
+                        "'reachability_minutes', 'disruption_risk_score'). "
+                        "Sorts and ties every row server-side -- use this "
+                        "instead of eyeballing a min/max across a long raw "
+                        "result yourself, which is where ties get missed and "
+                        "the wrong row gets picked."
+                    ),
+                },
+                "sort_desc": {
+                    "type": "boolean",
+                    "description": "True for highest-first; omit/false for lowest-first.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Cap the sorted rows returned, e.g. 'top 5'. Omit to "
+                        "see every row -- needed to catch a tie at the "
+                        "boundary you'd otherwise cut off."
+                    ),
+                },
+                "group_by": {
+                    "type": ["string", "array"],
+                    "description": (
+                        "For 'headcount by rank and base' or any 'how many "
+                        "per X' question: one field name, or a list for "
+                        "several (e.g. ['rank', 'base']). Returns one row per "
+                        "distinct combination with a 'count' field already "
+                        "computed -- use this instead of fetching every row "
+                        "and counting by eye, which is where a real count "
+                        "goes wrong across more than a handful of rows."
                     ),
                 },
             },
@@ -83,7 +136,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "duty_clock",
         "description": (
             "A crew member's accrued duty and block hours with headroom under "
-            "RULE-DUTY-02 and RULE-FLT-03. Windows are calendar-day based."
+            "RULE-DUTY-02 and RULE-FLT-03. Returns both duty_hours_this_date "
+            "(that single day's own hours -- use this for 'what were X's duty "
+            "hours on <date>') and duty_hours_7d (the rolling 7-day window "
+            "ending on date -- a different, usually larger, number). Windows "
+            "are calendar-day based."
         ),
         "input_schema": {
             "type": "object",
@@ -98,7 +155,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "check_legality",
         "description": (
             "Evaluate all 7 rules for assigning a crew member to a pairing, "
-            "named directly or via a flight on it. "
+            "named directly, via a flight on it, or via 'their rostered "
+            "duty on <aircraft> on <date>' (pass aircraft+date, resolved "
+            "against the crew member's own roster -- do not first look up "
+            "which of their pairings uses that aircraft yourself, this "
+            "does it correctly, including picking the right one by date). "
             "Returns a verdict per rule with the numbers, never a bare boolean. "
             "This is the only legal authority in the system."
         ),
@@ -120,7 +181,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "`date` alongside it."
                     ),
                 },
-                "date": {"type": "string", "description": "ISO date, with flight_no"},
+                "aircraft": {
+                    "type": "string", "pattern": "^VT-DX[A-F]$",
+                    "description": (
+                        "An aircraft tail instead of a flight or pairing -- "
+                        "pass `date` alongside it, e.g. 'C-5417's rostered "
+                        "VT-DXB duty on 19 Sep' -> aircraft='VT-DXB', "
+                        "date='2026-09-19'."
+                    ),
+                },
+                "date": {"type": "string", "description": "ISO date, with flight_no or aircraft"},
                 "delay_h": {
                     "type": "number",
                     "description": "Hypothetical departure delay, for near-miss checks",
@@ -220,11 +290,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "simulate",
         "description": (
             "Fork the world, apply a perturbation, re-evaluate, and return the "
-            "diff. Handles SICK_CREW, STATION_CLOSURE, TECH_DELAY, CERT_LAPSE. "
-            "event.pairing_id must be a real pairing id -- if the question "
-            "named a flight or aircraft instead, resolve it with `lookup` "
-            "first (flight -> its pairing, or aircraft + date -> pairing). "
-            "Never put a placeholder in event."
+            "diff: every crew member on the pairing whose legal/illegal status "
+            "flips. event.pairing_id must be a real pairing id -- if the "
+            "question named a flight or aircraft instead, resolve it with "
+            "`lookup` first (flight -> its pairing, or aircraft + date -> "
+            "pairing). A delay ('X minutes/hours late') goes in "
+            "event.delay_hours as a float number of HOURS -- not 'delay', "
+            "and convert minutes yourself (90 minutes late is delay_hours: "
+            "1.5). e.g. {'type':'TECH_DELAY','pairing_id':'P-2203',"
+            "'delay_hours':1.5}. Never put a placeholder in event."
         ),
         "input_schema": {
             "type": "object",
@@ -386,12 +460,57 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "suggest_pairing_ids",
+        "description": (
+            "Real pairing ids closest to one that doesn't match the "
+            "dataset's P-#### shape (e.g. 'P-22') -- for offering the "
+            "controller real alternatives to pick from. Deterministic "
+            "digit-prefix matching against the actual roster, not a guess: "
+            "never treat a suggestion as the pairing actually meant, only "
+            "list them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "near": {"type": "string", "description": "The malformed id as typed, e.g. 'P-22'."},
+                "limit": {"type": "integer", "description": "How many candidates to return (default 3)."},
+            },
+            "required": ["near"],
+        },
+    },
+    {
+        "name": "suggest_flight_nos",
+        "description": (
+            "Real flight numbers closest to one that doesn't match the "
+            "dataset's DX### shape (e.g. 'DX9999') -- for offering the "
+            "controller real alternatives to pick from. Deterministic "
+            "digit-prefix matching against the actual schedule, not a "
+            "guess: never treat a suggestion as the flight actually meant, "
+            "only list them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "near": {"type": "string", "description": "The malformed flight number as typed, e.g. 'DX9999'."},
+                "limit": {"type": "integer", "description": "How many candidates to return (default 3)."},
+            },
+            "required": ["near"],
+        },
+    },
+    {
         "name": "list_controllers",
         "description": (
             "The controller desks working this operation, by name and which "
-            "aircraft each covers. A controller dispatches; none of them are "
-            "crew, so this is never what answers a question about a crew "
-            "member even if a name looks similar."
+            "aircraft each covers -- often TWO aircraft per desk. Call this "
+            "first for 'the aircraft [controller name] covers/handles', "
+            "'who covers VT-DXA', or any question naming a controller by "
+            "first name alone (Ananya, Rohit, Divya are controllers, not "
+            "crew -- `lookup(entity='crew', filters={'name': 'Ananya'})` "
+            "will correctly find nobody). If the desk covers two aircraft, "
+            "the question is asking about both, not whichever one you check "
+            "first. A controller dispatches; none of them are crew, so this "
+            "is never what answers a question about a crew member even if a "
+            "name looks similar."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -407,11 +526,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         # Deliberately NOT in ADVISOR_TOOL_NAMES / foundry_tools()'s default
-        # list — this writes a real roster assignment, and a human clicking
+        # list. This writes a real roster assignment, and a human clicking
         # "Approve & commit" has to be the one who decides that, not the
-        # Resolution Advisor's own tool loop. It's a real tool schema (so
-        # `dispatch()` validates and traces it the same as the other ten)
-        # called directly by the console UI, never offered to the model.
+        # Resolution Advisor's own tool loop. It's still a real tool schema
+        # (so `dispatch()` validates and traces it the same as the other
+        # ten), just called directly by the console UI, never offered to
+        # the model.
         "name": "commit_decision",
         "description": (
             "Commit a candidate to a pairing: writes the roster assignment "
@@ -450,7 +570,7 @@ def foundry_tools(names: Any = None, schemas: list[dict[str, Any]] | None = None
 
     `schemas` lets a caller pass `schemas_for_port(port)`'s enriched list
     (real column names baked into `lookup`'s own description) instead of the
-    generic one — every tool is still offered to the model regardless; only
+    generic one. Every tool is still offered to the model either way; only
     the wording of `lookup`'s own schema differs. Imports the Azure SDK
     lazily so this module stays importable without the SDK installed (e.g.
     under `pytest`).
@@ -474,16 +594,16 @@ def foundry_tools(names: Any = None, schemas: list[dict[str, Any]] | None = None
 # Filter guard rails
 #
 # Measured over the tier-1 gold questions on a small local model: most
-# failures were an invented column name — and not a random guess, but the
+# failures were an invented column name. Not a random guess either, but the
 # *semantically right* field under a plausible other name (`departure` for
-# `dep_station`, `expiry_date` for `valid_to`). So three layers, in order of
-# preference:
+# `dep_station`, `expiry_date` for `valid_to`). So there are three layers,
+# in order of preference:
 #
 #   1. tell the model the real column names   (schema enrichment, below)
 #   2. map a near-miss onto the real one      (FIELD_ALIASES)
 #   3. reject loudly, naming what is valid    (resolve_filters)
 #
-# Guarding alone would only convert a wrong answer into a failed one; the
+# Guarding alone would only turn a wrong answer into a failed one; the
 # model still has to be able to succeed.
 # --------------------------------------------------------------------------
 
@@ -509,8 +629,8 @@ FIELD_ALIASES: dict[str, str] = {
 
 
 # Range operators. Equality stays the default — these exist because some
-# tier-1 questions are genuinely intervals ("expiring within 30 days of 15
-# Sep" is `valid_to` between two dates) and answering one by pulling every
+# tier-1 questions are genuinely about ranges ("expiring within 30 days of
+# 15 Sep" is `valid_to` between two dates). Answering that by pulling every
 # row and letting the model filter would put the selection back above the
 # trust boundary, which is the one thing this system does not do.
 RANGE_OPS: dict[str, str] = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
@@ -522,9 +642,9 @@ def resolve_filters(
     """Map filter keys onto real columns, or fail naming the valid ones.
 
     A value may be a scalar (equality), a list (membership), or a dict of
-    `RANGE_OPS` (an interval). An unknown operator is rejected here rather
-    than silently ignored — a dropped bound would quietly widen the result
-    set, and the caller would have no way to tell.
+    `RANGE_OPS` (a range). An unknown operator is rejected here rather than
+    silently ignored — a dropped bound would quietly widen the result set,
+    with no way for the caller to tell.
     """
     resolved: dict[str, Any] = {}
     for key, value in (filters or {}).items():
@@ -557,10 +677,10 @@ def with_crew_identity(rows: list[dict[str, Any]],
                        crew: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach name and rank to rows keyed by crew_id.
 
-    `reserve_pool` holds a crew id and an on-call window and nothing about the
-    person — but "who is on reserve" is unanswerable if you cannot see whether
-    they are a Captain. The join belongs here, in the layer whose job is to
-    present a domain entity rather than a table.
+    `reserve_pool` holds a crew id and an on-call window, nothing about the
+    person — but "who is on reserve" can't be answered if you can't see
+    whether they're a Captain. The join belongs here, in the layer whose
+    job is to present a domain entity rather than a table.
     """
     by_id = {c["crew_id"]: c for c in crew}
     out = []
@@ -574,9 +694,10 @@ def with_crew_identity(rows: list[dict[str, Any]],
 def crew_named(port: Any, name: str) -> list[dict[str, Any]]:
     """Roster entries whose name matches, by surname or in full.
 
-    Deliberately returns every match rather than a best one: several surnames
-    repeat across this dataset's 150 crew, sometimes across ranks and bases.
-    There is no defensible way to pick one, so the caller asks.
+    Deliberately returns every match rather than picking a best one. Several
+    surnames repeat across this dataset's 150 crew, sometimes across ranks
+    and bases, and there's no defensible way to pick one — so the caller
+    asks.
     """
     wanted = name.strip().lower()
     if not wanted:
@@ -590,13 +711,13 @@ def crew_named(port: Any, name: str) -> list[dict[str, Any]]:
 
 
 def suggest_crew_names(port: Any, name: str, limit: int = 3) -> list[dict[str, Any]]:
-    """Real crew names closest to one that matched nobody -- for a typo
+    """Real crew names closest to one that matched nobody — for a typo
     ("A. Nayar" for "A. Nair"), the same "suggest, never substitute"
-    discipline `core_engine/resolve.py` already applies to ids. Plain
+    discipline `core_engine/resolve.py` already applies to ids. Uses plain
     character-level closeness (`difflib`), not BM25: a single misspelled
     surname is too short for term-frequency ranking to mean anything, and
     this dataset's 150 names is small enough that a direct closeness scan
-    is instant.
+    is instant anyway.
     """
     import difflib
 
@@ -616,7 +737,7 @@ def _comparable(value: Any) -> Any:
 
     ISO-8601 dates sort correctly as strings, which is why the range filters
     work at all against JSON. Comparing both sides as text is exact for ISO
-    dates and harmless for everything else that reaches here.
+    dates, and harmless for everything else that reaches here.
     """
     return value if isinstance(value, (int, float)) else str(value)
 
@@ -652,8 +773,8 @@ def row_matches(row: dict[str, Any], column: str, want: Any) -> bool:
 def schemas_for_port(port: Any) -> list[dict[str, Any]]:
     """`TOOL_SCHEMAS` with `lookup` enriched by the backend's real field names.
 
-    Without this the model is guessing at column names from the entity name
-    alone, which is where nearly every tier-1 tool failure came from.
+    Without this, the model is guessing at column names from the entity
+    name alone, which is where nearly every tier-1 tool failure came from.
     """
     describe = getattr(port, "entity_fields", None)
     if describe is None:
@@ -702,7 +823,7 @@ class ToolPort(Protocol):
     def notification_brief(self, crew_id: str, pairing_id: str) -> dict[str, Any]: ...
     def check_legality(self, crew_id: str, pairing_id: str | None = None,
                        flight_id: str | None = None, flight_no: str | None = None,
-                       date: str | None = None,
+                       date: str | None = None, aircraft: str | None = None,
                        delay_h: float = 0.0) -> dict[str, Any]: ...
     def same_pairing(self, a: str, b: str) -> dict[str, Any]: ...
     def find_options(self, role: str | None = None, pairing_id: str | None = None,
@@ -715,6 +836,8 @@ class ToolPort(Protocol):
     def explain_rule(self, rule_id: str) -> dict[str, Any]: ...
     def search_rules(self, query: str, top_k: int = 3) -> list[dict[str, Any]]: ...
     def suggest_crew_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]: ...
+    def suggest_pairing_ids(self, near: str, limit: int = 3) -> list[dict[str, Any]]: ...
+    def suggest_flight_nos(self, near: str, limit: int = 3) -> list[dict[str, Any]]: ...
     def list_controllers(self) -> list[dict[str, Any]]: ...
     def controller_issue_counts(self) -> list[dict[str, Any]]: ...
     def check_gate(self, flight_id: str | None = None, flight_no: str | None = None,
@@ -744,10 +867,10 @@ class ToolError(RuntimeError):
 def validate_args(name: str, args: dict[str, Any]) -> None:
     """Check arguments against the tool's own JSON Schema before calling it.
 
-    The schemas already carry patterns like `^P-[0-9]{4}$`; without this check
-    a call like `find_options(pairing_id="BLR->BOM")` would reach the engine
-    and fail there with a message about missing fixtures rather than about the
-    malformed id. Catching it here says what is actually wrong.
+    The schemas already carry patterns like `^P-[0-9]{4}$`. Without this
+    check, a call like `find_options(pairing_id="BLR->BOM")` would reach the
+    engine and fail there with a message about missing fixtures, rather than
+    about the malformed id. Catching it here says what's actually wrong.
     """
     schema = next((t["input_schema"] for t in TOOL_SCHEMAS if t["name"] == name), None)
     if not schema:
@@ -780,8 +903,8 @@ def validate_args(name: str, args: dict[str, Any]) -> None:
 def dispatch(port: ToolPort, name: str, args: dict[str, Any]) -> TraceEntry:
     """Invoke one tool and record it. Never raises — errors become trace rows.
 
-    A tool failure has to reach the model as data so it can route around it;
-    an exception here would take the whole turn down instead.
+    A tool failure has to reach the model as data so it can route around it.
+    An exception here would take the whole turn down instead.
     """
     started = time.perf_counter()
 

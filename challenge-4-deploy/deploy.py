@@ -13,18 +13,20 @@ this repo:
             3-step InvokeAzureAgent chain visible in the portal's visual
             workflow builder.
 
-Part B cannot reproduce the verifier gate -- a Workflow's steps are agent
+Part B can't reproduce the verifier gate -- a Workflow's steps are agent
 invocations with no deterministic Python step in between -- so it chains the
-three agents directly and is explicitly the smaller-fidelity of the two
-paths. That trade-off is called out below and in the README, not hidden.
+three agents directly and is openly the lower-fidelity of the two paths.
+That trade-off is called out below and in the README, not hidden.
 """
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+import openai
 
 
 def _find_repo_root() -> Path:
@@ -38,13 +40,12 @@ REPO_ROOT = _find_repo_root()
 load_dotenv(REPO_ROOT / ".env")
 
 # The engine, agents and pipeline glue all live in challenge-1-build/ --
-# referenced from here rather than duplicated, the same way the other
-# scenarios' challenge-4-deploy.py reaches back into challenge-1-build for
-# their data file.
+# referenced from here, not duplicated, the same way the other scenarios'
+# challenge-4-deploy.py reaches back into challenge-1-build for their
+# data file.
 CHALLENGE_1_DIR = REPO_ROOT / "challenge-1-build"
 sys.path.insert(0, str(CHALLENGE_1_DIR))
 
-import config
 from agents import ExplainerAgent, ResolutionAdvisorAgent, TriageAgent, answer_question
 from core_engine.port import JsonToolPort
 
@@ -114,20 +115,40 @@ def run_gold_question_scorecard(port, triage, advisor, explainer_agent) -> dict:
     """Run every question in evaluation_dataset.json through the full
     pipeline and report a per-tier verified rate.
 
-    This is a *sourcing* scorecard, not a correctness grader: it reports
-    how many answers passed verifier.py (every claim traced to a tool call),
-    which is the property this whole architecture exists to guarantee.
-    Comparing the verified narrative's content against each question's
-    `expected_output` by hand is the next step, same as the other scenarios'
-    Coherence/Fluency portal evaluation is a starting point, not the final
-    word.
+    This is a *sourcing* scorecard, not a correctness grader: it reports how
+    many answers passed verifier.py (every claim traced to a tool call),
+    the property this whole architecture exists to guarantee. Comparing the
+    verified narrative's content against each question's `expected_output`
+    by hand is the next step -- like the other scenarios' Coherence/Fluency
+    portal evaluation, this is a starting point, not the final word.
     """
     print("\n=== Step 2: Gold-Question Scorecard ===")
     questions = _load_eval_questions()
 
     by_tier: dict[int, list[bool]] = {1: [], 2: [], 3: []}
     for q in questions:
-        response = answer_question(q["input"], port, triage, advisor, explainer_agent)
+        # The fine-tuned deployment's rate limit is tight enough that a 429
+        # mid-run is routine, not exceptional -- crashing the whole 38-
+        # question run over one transient limit throws away every question
+        # already answered. Retry with backoff instead; only give up on a
+        # question (never on the whole run) after repeated failures.
+        response = None
+        for attempt in range(1, 5):
+            try:
+                response = answer_question(q["input"], port, triage, advisor, explainer_agent)
+                break
+            except openai.RateLimitError:
+                wait = 20 * attempt
+                print(f"      rate limited on {q['id']}, retrying in {wait}s "
+                      f"(attempt {attempt}/4)...")
+                time.sleep(wait)
+
+        if response is None:
+            by_tier[q["tier"]].append(False)
+            print(f"  [FAIL] {q['id']} (tier {q['tier']}): rate-limited after "
+                  f"4 attempts -- {q['input'][:60]}")
+            continue
+
         verified = response.confidence.value != "low" and not response.awaiting
         by_tier[q["tier"]].append(verified)
         mark = "PASS" if verified else "  ? "

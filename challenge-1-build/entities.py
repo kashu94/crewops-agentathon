@@ -31,8 +31,10 @@ CREW_RE = re.compile(r"\bC-\d{4}\b")
 # real id never shows up in both lists.
 MALFORMED_CREW_RE = re.compile(r"\bC-(?!\d{4}\b)\d+\b")
 PAIRING_RE = re.compile(r"\bP-\d{4}\b")
+MALFORMED_PAIRING_RE = re.compile(r"\bP-(?!\d{4}\b)\d+\b")
 FLIGHT_ID_RE = re.compile(r"\bDX\d{3}-\d{4}-\d{2}-\d{2}\b")
 FLIGHT_NO_RE = re.compile(r"\bDX\d{3}\b")
+MALFORMED_FLIGHT_NO_RE = re.compile(r"\bDX(?!\d{3}\b)\d+\b")
 RULE_RE = re.compile(r"\bRULE-[A-Z]{3,4}-\d{2}\b")
 AIRCRAFT_RE = re.compile(r"\bVT-DX[A-F]\b")
 AC_TYPE_RE = re.compile(r"\b(A320|ATR-?72)\b", re.I)
@@ -82,10 +84,10 @@ _STATION_FALSE_FRIENDS = frozenset(
     {"FDP", "UTC", "AND", "THE", "FOR", "WHO", "NOT", "ALL", "ANY", "CAN", "HOW"}
 )
 
-# A controller says the city, not the IATA code -- this is a fixed, tiny
+# A controller says the city, not the IATA code. This is a fixed, tiny
 # vocabulary (8 stations, their common English names), so a plain alias
-# table is the right tool, not a search of any kind: there is no fuzzy
-# judgment call in "Bangalore means BLR", only a lookup.
+# table is the right tool, not any kind of search — there's no fuzzy
+# judgment call in "Bangalore means BLR", just a lookup.
 STATION_ALIASES: dict[str, str] = {
     "bangalore": "BLR", "bengaluru": "BLR",
     "bombay": "BOM", "mumbai": "BOM",
@@ -114,16 +116,32 @@ class Entities:
 
     crew_ids: list[str] = field(default_factory=list)
     malformed_crew_ids: list[str] = field(default_factory=list)
-    """A crew id shaped like `C-##...` but not the dataset's 4-digit form --
-    never in `crew_ids`, since it never matches `CREW_RE`. Candidates for
+    """A crew id shaped like `C-##...` but not the dataset's 4-digit form.
+    Never in `crew_ids`, since it never matches `CREW_RE`. Candidates for
     `suggest_crew_ids`, never for a lookup itself."""
     pairing_ids: list[str] = field(default_factory=list)
+    malformed_pairing_ids: list[str] = field(default_factory=list)
+    """A pairing id shaped like `P-##...` but not the dataset's 4-digit
+    form. Never in `pairing_ids`. Candidates for `suggest_pairing_ids`,
+    never for a lookup itself."""
     flight_ids: list[str] = field(default_factory=list)
     flight_nos: list[str] = field(default_factory=list)
+    malformed_flight_nos: list[str] = field(default_factory=list)
+    """A flight number shaped like `DX##...` but not the dataset's 3-digit
+    form. Never in `flight_nos`. Candidates for `suggest_flight_nos`,
+    never for a lookup itself."""
     rule_ids: list[str] = field(default_factory=list)
     aircraft: list[str] = field(default_factory=list)
     aircraft_types: list[str] = field(default_factory=list)
     stations: list[str] = field(default_factory=list)
+    malformed_stations: list[str] = field(default_factory=list)
+    """A 3-letter all-caps token that reads like a station code but isn't
+    one of the 8 real ones, and isn't a common word like "THE"/"AND"
+    either. Never in `stations`. "What flights operate from BLR to XYZ?"
+    used to just drop "XYZ" with no signal anything was ignored, silently
+    answering a different, broader question (every BLR departure) than
+    the one asked. Candidates for a "did you mean" suggestion, never a
+    silent substitution."""
     dates: list[str] = field(default_factory=list)
     times: list[str] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
@@ -207,10 +225,10 @@ def extract_dates(text: str) -> list[str]:
                 found.append(candidate)
 
     if not found and _TODAY_RE.search(text):
-        # The real wall-clock date -- NOT a day inside the dataset's fixed
+        # The real wall-clock date — NOT a day inside the dataset's fixed
         # week. This dataset is a historical/fixed snapshot (see
         # config.WEEK_START/END), so "today" almost certainly falls outside
-        # it; silently remapping it onto day 1 of that week would hide a
+        # it. Silently remapping it onto day 1 of that week would hide a
         # real "there is no data for today" answer behind a fabricated one.
         found.append(date.today().isoformat())
 
@@ -227,9 +245,9 @@ _HORIZON_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
 
 
 # A person written the way the system writes them back — "A. Nair" — or a
-# bare capitalised surname. These are *candidates*: the roster decides which
-# are people, because the alternative is a hardcoded name list that goes stale
-# the moment the dataset changes.
+# bare capitalised surname. These are *candidates*; the roster decides which
+# are actually people, since the alternative is a hardcoded name list that
+# goes stale the moment the dataset changes.
 PERSON_RE = re.compile(r"\b([A-Z]\.\s*[A-Z][a-z]{2,})\b|\b([A-Z][a-z]{2,})\b")
 
 # Capitalised words that open a sentence or name a concept, not a person.
@@ -250,8 +268,8 @@ def extract_names(text: str) -> list[str]:
     """Names a controller might have used instead of an id.
 
     Only candidates. Several surnames repeat across this dataset's 150 crew,
-    so nothing here resolves to a person without the roster — and where it is
-    ambiguous the controller is asked, never guessed at.
+    so nothing here resolves to a person without the roster — where it's
+    ambiguous, the controller is asked, never guessed at.
     """
     found: list[str] = []
     for full, bare in PERSON_RE.findall(text):
@@ -265,9 +283,9 @@ def extract_names(text: str) -> list[str]:
 def extract_horizon(text: str) -> int | None:
     """A forward-looking window in days — "within 30 days", "next 2 weeks".
 
-    A question about expiry is an interval, not a point. A month is taken as
-    30 days — what "within a month" means to a controller reading a roster,
-    and it keeps the arithmetic checkable.
+    A question about expiry is a range, not a single point. A month is taken
+    as 30 days, which is what "within a month" means to a controller reading
+    a roster, and keeps the arithmetic easy to check.
     """
     match = _HORIZON_RE.search(text)
     if not match:
@@ -326,6 +344,16 @@ def extract(text: str) -> Entities:
         for s in STATION_RE.findall(text)
         if s in config.STATIONS and s not in _STATION_FALSE_FRIENDS
     ] + [STATION_ALIASES[city.lower()] for city in CITY_RE.findall(text)]
+    malformed_stations = [
+        m.group()
+        for m in STATION_RE.finditer(text)
+        if m.group() not in config.STATIONS
+        and m.group() not in _STATION_FALSE_FRIENDS
+        # "VT-DXB" contains "DXB" as its own 3-letter-caps match once the
+        # hyphen creates a word boundary -- that's an aircraft tail, not an
+        # attempted station code, and must not be flagged as one.
+        and text[max(0, m.start() - 3):m.start()] != "VT-"
+    ]
 
     roles = [name for name, pat in ROLE_PATTERNS if pat.search(text)]
 
@@ -340,12 +368,15 @@ def extract(text: str) -> Entities:
         crew_ids=_dedupe(CREW_RE.findall(text)),
         malformed_crew_ids=_dedupe(MALFORMED_CREW_RE.findall(text)),
         pairing_ids=_dedupe(PAIRING_RE.findall(text)),
+        malformed_pairing_ids=_dedupe(MALFORMED_PAIRING_RE.findall(text)),
         flight_ids=_dedupe(flight_ids),
         flight_nos=_dedupe(flight_nos),
+        malformed_flight_nos=_dedupe(MALFORMED_FLIGHT_NO_RE.findall(text)),
         rule_ids=_dedupe(RULE_RE.findall(text)),
         aircraft=_dedupe(AIRCRAFT_RE.findall(text)),
         aircraft_types=_dedupe(ac_types),
         stations=_dedupe(stations),
+        malformed_stations=_dedupe(malformed_stations),
         dates=extract_dates(text),
         times=extract_times(text),
         roles=roles,
@@ -358,11 +389,11 @@ def extract(text: str) -> Entities:
 
 
 # --------------------------------------------------------------------------
-# The one spelling of "every way to say a rank" -- shared by every regex
+# The one spelling of "every way to say a rank", shared by every regex
 # below that needs to recognise one (id-based, name-based, and
-# `core_engine.port.JsonToolPort._resolve_person`'s own prefix check), so a
-# new synonym is added in one place rather than three that can drift apart.
-# "F.O."/"F. O." (dotted/spaced) matters as much as "FO"/"F/O": a name-led
+# `core_engine.port.JsonToolPort._resolve_person`'s own prefix check). A new
+# synonym is added in one place, rather than three that can drift apart.
+# "F.O."/"F. O." (dotted/spaced) matters as much as "FO"/"F/O" — a name-led
 # question is exactly where a controller writes it out this way.
 RANK_WORD_RE_FRAGMENT = (
     r"captain|cpt|capt|commander|skipper|first officer|f\.?/?o\.?|"
@@ -370,7 +401,7 @@ RANK_WORD_RE_FRAGMENT = (
 )
 
 # A rank used to *describe* a named crew member — "FO C-2087", "Captain
-# C-1042" — as opposed to specifying a seat to be filled ("cover as Captain").
+# C-1042" — as opposed to naming a seat to be filled ("cover as Captain").
 # Only the descriptive form asserts something about that person that the
 # roster can contradict.
 STATED_RANK_RE = re.compile(
@@ -407,10 +438,10 @@ def stated_ranks(text: str) -> list[tuple[str, str]]:
 
 
 # Same idea as `STATED_RANK_RE`, but the descriptive form names a person by
-# name rather than by id ("F.O. A. Nair") -- just as unrecoverable to answer
-# under the wrong rank, so it needs the same roster check. The rank half is
+# name rather than by id ("F.O. A. Nair"). Answering it under the wrong rank
+# would be just as bad, so it needs the same roster check. The rank half is
 # matched case-insensitively (`(?i:...)`) while the name half stays
-# case-sensitive -- letting the whole pattern ignore case would make the
+# case-sensitive — letting the whole pattern ignore case would make the
 # name half start matching ordinary lowercase words too.
 STATED_RANK_NAME_RE = re.compile(
     rf"\b((?i:{RANK_WORD_RE_FRAGMENT}))\s+"
@@ -432,10 +463,10 @@ def stated_rank_names(text: str) -> list[tuple[str, str]]:
     return out
 
 
-# A base or a rating stated ahead of *or* after a crew id -- "DEL-based
-# captain C-1042" and "C-3316 is A320-rated" are both descriptive claims
-# the roster can contradict, the exact same category as a stated rank, just
-# a different attribute. Bounded to a short window either side so it can't
+# A base or a rating stated ahead of *or* after a crew id — "DEL-based
+# captain C-1042" and "C-3316 is A320-rated" are both descriptive claims the
+# roster can contradict, the same category as a stated rank, just a
+# different attribute. Bounded to a short window on either side so it can't
 # accidentally pair a station or aircraft type mentioned elsewhere in a long
 # question with an unrelated crew id.
 _BASE_BEFORE_ID_RE = re.compile(r"\b([A-Z]{3})-based\b[^.?!]{0,40}?\b(C-\d{4})\b", re.I)
@@ -444,6 +475,11 @@ _ID_BEFORE_BASE_RE = re.compile(
 _RATING_BEFORE_ID_RE = re.compile(r"\b(A320|ATR-?72)-rated\b[^.?!]{0,40}?\b(C-\d{4})\b", re.I)
 _ID_BEFORE_RATING_RE = re.compile(
     r"\b(C-\d{4})\b[^.?!]{0,40}?\bis\s+(A320|ATR-?72)-rated\b", re.I)
+_PAIRING_DAYS_RE = re.compile(
+    r"\b(P-\d{4})\b[^.?!]{0,40}?\bis\s+a\s+"
+    r"(single|one|1|two|2|three|3|four|4)-day\s+pairing\b", re.I)
+_DAY_WORD_TO_INT = {"single": 1, "one": 1, "1": 1, "two": 2, "2": 2,
+                     "three": 3, "3": 3, "four": 4, "4": 4}
 
 
 def stated_bases(text: str) -> list[tuple[str, str]]:
@@ -474,3 +510,36 @@ def stated_ratings(text: str) -> list[tuple[str, str]]:
     for crew_id, rating in _ID_BEFORE_RATING_RE.findall(text):
         out.append((crew_id, rating.upper().replace("-", "")))
     return out
+
+
+_PAIRING_DATE_RE = re.compile(
+    r"\b(P-\d{4})\b[^.?!]{0,40}?\bfor\s+"
+    r"(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})\b", re.I)
+
+
+def stated_pairing_dates(text: str) -> list[tuple[str, str]]:
+    """(pairing_id, ISO date the query claims it operates on).
+
+    An explicit year is trusted, not silently overridden by
+    `config.DEFAULT_YEAR`. "P-2291 ... for 15 September 2025" names a real
+    pairing but the wrong year — that needs to be caught, not quietly
+    answered as if the controller meant 2026.
+
+    >>> stated_pairing_dates("Check legality of C-3310 on P-2291 for 15 September 2025.")
+    [('P-2291', '2025-09-15')]
+    """
+    out = []
+    for pid, raw_date in _PAIRING_DATE_RE.findall(text):
+        if parsed := extract_dates(raw_date):
+            out.append((pid, parsed[0]))
+    return out
+
+
+def stated_pairing_days(text: str) -> list[tuple[str, int]]:
+    """(pairing_id, day count the query claims that pairing spans).
+
+    >>> stated_pairing_days("Since P-2291 is a single-day pairing, who's cheapest?")
+    [('P-2291', 1)]
+    """
+    return [(pid, _DAY_WORD_TO_INT[word.lower()])
+            for pid, word in _PAIRING_DAYS_RE.findall(text)]

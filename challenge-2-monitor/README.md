@@ -13,11 +13,12 @@ By the end of this challenge, you will have:
 
 ## Context
 
-Three model calls sit inside every answer this scenario produces (Triage,
-Resolution Advisor, Explainer), plus up to eight tool round-trips inside the
-Resolution Advisor's own loop. When a controller-facing answer looks wrong,
-the question is always "which of those calls did it, and with what input?" —
-and the only honest way to answer that is a trace, not a guess.
+Up to three model calls sit inside every answer this scenario produces
+(Triage, Resolution Advisor, Explainer), plus up to eight tool round-trips
+inside the Resolution Advisor's own loop. When a controller-facing answer
+looks wrong, the question is always "which of those calls did it, and with
+what input?" — and the only honest way to answer that is a trace, not a
+guess.
 
 ## Get Started
 

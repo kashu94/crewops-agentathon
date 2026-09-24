@@ -1,16 +1,16 @@
 """Duty arithmetic.
 
-Two conventions in this dataset silently produce plausible-but-wrong answers,
-and both live here.
+Two conventions in this dataset can quietly produce plausible-but-wrong
+answers, and both are handled here.
 
 1. Windows are **calendar-day** based — UTC dates inclusive of the duty date,
    not rolling 168/672-hour windows from an instant.
 2. The FDP limit **shrinks with sector count**: 13h minus half an hour per
    sector beyond the second. A four-sector duty caps at 12.0h, not 13.
 
-Canary: C-1042 accrues 20.93 duty hours over the seven calendar days ending
-2026-09-14, leaving 39.07h of headroom. If that is right, the window maths is
-right.
+Canary check: C-1042 accrues 20.93 duty hours over the seven calendar days
+ending 2026-09-14, leaving 39.07h of headroom. If that's right, the window
+math is right.
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ def release_time(last_arrival: datetime) -> datetime:
 def calendar_window(end: date, days: int) -> tuple[date, date]:
     """The inclusive calendar-day window of `days` ending on `end`.
 
-    Seven days ending the 14th is the 8th through the 14th — not the 7th.
-    Off-by-one here is the single most likely source of a wrong legality
-    verdict, which is why it is one named function rather than inline maths.
+    Seven days ending the 14th is the 8th through the 14th, not the 7th.
+    An off-by-one here is the single most likely source of a wrong legality
+    verdict, which is why this is one named function instead of inline math.
 
     >>> calendar_window(date(2026, 9, 14), 7)
     (datetime.date(2026, 9, 8), datetime.date(2026, 9, 14))
@@ -101,14 +101,30 @@ class DutyDay:
         return round(self.fdp_limit - self.fdp_hours, 2)
 
     def delayed(self, hours: float) -> "DutyDay":
-        """The same duty with its start pushed back — the what-if shape.
+        """The same duty with its release pushed back — the what-if shape.
 
-        A delay extends the duty period, so it can push an otherwise legal
-        crew past their FDP limit on the tail legs. The delay itself creates
-        the crewing problem.
+        Report time is unaffected: the crew still shows up on time. A
+        downstream delay (a late departure) extends how long they're on
+        duty, so only `release_utc` moves. Shifting both by the same amount
+        would leave `fdp_hours` (release - report) unchanged, making a delay
+        structurally incapable of ever pushing anyone past their FDP limit —
+        which would defeat the entire point of simulating one.
+        """
+        from dataclasses import replace
+
+        return replace(self, release_utc=self.release_utc + timedelta(hours=hours))
+
+    def shifted(self, hours: float) -> "DutyDay":
+        """The whole duty pushed later by `hours`, report and release both.
+
+        For positioning (a deadheading crew member needing extra travel
+        time to reach the departure station), not a delay. The day simply
+        starts later and ends later by the same amount, so its own FDP
+        duration is unaffected — unlike `delayed`, where a late departure
+        stretches the day instead of just moving it.
         """
         from dataclasses import replace
 
         shift = timedelta(hours=hours)
         return replace(self, report_utc=self.report_utc + shift,
-                       release_utc=self.release_utc + shift + shift * 0)
+                       release_utc=self.release_utc + shift)

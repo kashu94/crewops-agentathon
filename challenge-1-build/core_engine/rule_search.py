@@ -1,5 +1,5 @@
 """Hybrid (BM25 + semantic) search over the 7 legality rules, for a
-paraphrased legality question that never names a rule id -- "can duty run
+paraphrased legality question that never names a rule id — "can duty run
 long on a short day" rather than "what does RULE-FDP-01 say". `explain_rule`
 in `port.py` already handles the exact-id case perfectly and stays
 untouched; this is additive, for the one case it can't cover.
@@ -7,7 +7,7 @@ untouched; this is additive, for the one case it can't cover.
 Backed by `rules_vec` in the shared Postgres ledger, a real table this
 project's original system already populated (7 rows, one per rule, each
 with both a `search_tsv` full-text column and a 384-dim `embedding`
-column) -- not something built fresh for this feature.
+column), not something built fresh for this feature.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def enabled() -> bool:
 def search_rules(query: str, top_k: int = 3, alpha: float = 0.5) -> list[dict[str, Any]]:
     """The `top_k` rules best matching `query`, ranked by
     `alpha * BM25 + (1 - alpha) * semantic`. Returns `[]` if the ledger or
-    the embedding model isn't configured -- absent config is a no-op here,
+    the embedding model isn't configured. Missing config is a no-op here,
     not an error, same as every other Postgres-backed feature in this repo."""
     if not enabled():
         return []

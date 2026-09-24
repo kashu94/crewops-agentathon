@@ -40,10 +40,10 @@ function initials(name) {
   return name.split(/\s+/).map((p) => p[0]).join("").slice(0, 2).toUpperCase();
 }
 
-// A stable colour per name, not a random one per render -- the same
+// A fixed colour per name, not a random one per render -- the same
 // controller should always show the same avatar colour across pages and
-// reloads. Picked from a small fixed palette rather than deriving raw RGB
-// from a hash, so every combination stays legible against a white avatar.
+// reloads. Picked from a small fixed palette instead of a raw RGB hash,
+// so every combination stays readable against a white avatar.
 const AVATAR_PALETTE = ["#b3441f", "#1f6f4a", "#3b4bb0", "#8a6d1f", "#7a3b8a"];
 function avatarColor(name) {
   let hash = 0;
@@ -140,10 +140,10 @@ function escapeHtml(s) {
 }
 
 // Floating Advisor Chat widget -- a bubble in the bottom-right corner on
-// every page, not a separate nav destination. It is a plain multi-page app
-// (each nav click is a full page load), so unlike a single-page client the
-// widget's history does not survive navigating to a different page; it
-// starts fresh each time, which is an accepted trade-off for staying
+// every page, not a separate nav destination. This is a plain multi-page
+// app (each nav click is a full page load), so unlike a single-page app
+// the widget's chat history doesn't survive moving to a different page --
+// it starts fresh each time. An accepted trade-off for staying
 // framework-free.
 const CHAT_EXAMPLES = [
   "Is C-2087 legal to cover P-2291?",

@@ -6,7 +6,7 @@ Time: ~1.5–2 hours end-to-end (mostly waiting on the training job, not on you)
 
 By the end of this challenge, you will have:
 
-- ✅ Generated a 190+-example fine-tuning set by **self-distillation** — no
+- ✅ Generated a 200+-example fine-tuning set by **self-distillation** — no
   hand-labeling, no external annotator
 - ✅ Understood exactly what this fine-tune can and cannot improve, and why
 - ✅ Run an Azure OpenAI fine-tuning job against it and deployed the result
@@ -58,27 +58,31 @@ is this repo, not a bigger model or a human.
    though the router classifies both correctly — see `EXTRA_TEMPLATES` in
    the script.
 
-**Two intents are deliberately absent: `SIMULATE_WHATIF` and
-`RESOLVE_ILLEGAL`.** `seed_calls()` seeds no opening call for either, by
-design — they are exactly the cases meant to need the Advisor's own
-judgment. There is no local oracle for them, so none is faked. `JOINT_PLAN`
-coverage also depends on how a question names the disruption: "both A320
-captains (VT-DXA and VT-DXB) are sick" names aircraft, not pairing ids, so
-`seed_calls()` has nothing to seed from it either — the same honest limit,
-not a bug.
+**Four intents are absent.** `SIMULATE_WHATIF` and `RESOLVE_ILLEGAL`:
+`seed_calls()` deliberately seeds no opening call for either — they are
+exactly the cases meant to need the Advisor's own judgment, so there is no
+local oracle to fake. `JOINT_PLAN`: coverage depends on how a question names
+the disruption ("both A320 captains (VT-DXA and VT-DXB) are sick" names
+aircraft, not pairing ids, so `seed_calls()` has nothing to seed from it
+either) — the same honest limit, not a bug. `LOOKUP_CONTROLLERS`: no gold
+question and no `EXTRA_TEMPLATES` entry currently exercises it.
 
-Running it with the default settings produces **~210 examples across 13 of
-17 intents** (179 train / 31 validation after an 85/15 split):
+Running `python generate_training_data.py --variants-per-question 10` (seed
+42, the default) produces **204 examples across 14 of the 18 intents**
+(174 train / 30 validation after an 85/15 split):
 
 | Intent | Examples | Intent | Examples |
 |---|---|---|---|
 | LOOKUP_FLIGHT | 40 | LOOKUP_CREW | 17 |
-| CHECK_LEGALITY | 33 | RANK_OPTIONS | 15 |
-| LOOKUP_DUTY_CLOCK | 22 | CHECK_GATE | 13 |
-| DRAFT_NOTIFICATION | 11 | LOOKUP_ROSTER | 10 |
+| CHECK_LEGALITY | 33 | CHECK_GATE | 13 |
+| LOOKUP_DUTY_CLOCK | 22 | LOOKUP_ROSTER | 10 |
+| DRAFT_NOTIFICATION | 11 | RANK_OPTIONS | 9 |
 | IMPACT_OF_EVENT | 11 | FIND_REPLACEMENT | 8 |
 | LOOKUP_RISK | 11 | EXPLAIN_RULE | 7 |
 | LOOKUP_CERT | 6 | LOOKUP_RESERVE | 6 |
+
+These counts will drift slightly as the router, planner or verifier change —
+re-run the generator rather than trusting this table verbatim.
 
 ## Get Started
 

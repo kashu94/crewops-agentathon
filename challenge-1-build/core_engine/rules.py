@@ -1,13 +1,13 @@
 """The seven rules.
 
-Each returns a `RuleVerdict` carrying the numbers, never a bare boolean — a
-controller acting on "illegal" needs to know *by how much*, because "exceeds
-by 1h20m" is actionable and "illegal" is not.
+Each returns a `RuleVerdict` carrying the numbers, never a bare boolean.
+A controller acting on "illegal" needs to know *by how much*, because
+"exceeds by 1h20m" is actionable and "illegal" is not.
 
 Rules are evaluated against a `CrewSnapshot`, which is whatever the backend
 already knows about one crew member. Keeping the rules pure functions of a
-snapshot means they are testable without a database and identical whichever
-port supplies the data.
+snapshot means they're testable without a database, and behave the same
+whichever port supplies the data.
 """
 
 from __future__ import annotations
@@ -105,11 +105,11 @@ def check_duty_window(
     """60 duty hours in any 7 consecutive calendar days, inclusive.
 
     The prospective duty counts, and so do the *earlier days of the same
-    pairing* — assigning someone a two-day trip adds both days to the window,
+    pairing*. Assigning someone a two-day trip adds both days to the window,
     so day 2 must be checked against a window that already contains day 1.
 
-    Miss that and a cover looks legal on day 1 and legal again on day 2, when
-    together they breach.
+    Miss that, and a cover can look legal on day 1 and legal again on day 2,
+    even though together they breach.
     """
     start, stop = calendar_window(day.date, DUTY_WINDOW_DAYS)
     already = crew.duty_in_window(day.date)
@@ -166,13 +166,13 @@ def check_flight_window(
 def check_rest(crew: CrewSnapshot, day: DutyDay, exclude_pairing: str | None = None) -> RuleVerdict:
     """12h rest between release and next report — checked on both sides.
 
-    Rest before the new duty is the obvious half. The half that gets missed is
-    rest before whatever the candidate is *already* rostered for next: cover
-    them tonight and you can strand tomorrow's departure instead.
+    Rest before the new duty is the obvious half. The half that gets missed
+    is rest before whatever the candidate is *already* rostered for next:
+    cover them tonight and you can strand tomorrow's departure instead.
     """
-    # `last_rest_ended` marks when their rest *finished* — the earliest they
-    # are legal again — not when their last duty released. Subtracting 12h
-    # from it double-counts the rest they have already taken and rejects
+    # `last_rest_ended` marks when their rest *finished* — the earliest
+    # they're legal again — not when their last duty released. Subtracting
+    # 12h from it would double-count rest they've already taken and reject
     # crew who are demonstrably available.
     if crew.last_rest_ended is not None and day.report_utc < crew.last_rest_ended:
         short = hours_between(day.report_utc, crew.last_rest_ended)
@@ -224,12 +224,12 @@ def check_qualification(crew: CrewSnapshot, day: DutyDay) -> RuleVerdict:
 def check_certifications(crew: CrewSnapshot, day: DutyDay) -> RuleVerdict:
     """Every certification still valid on every duty date of the pairing.
 
-    **Expiry only — `valid_from` is not checked, deliberately.** In this
-    dataset all 150 licence records carry a `valid_from` years in the future,
-    and some are incoherent (a start date after their own end date).
+    **Expiry only — `valid_from` is deliberately not checked.** In this
+    dataset, all 150 licence records carry a `valid_from` years in the
+    future, and some are incoherent (a start date after their own end date).
     Enforcing it would exclude every pilot in the airline.
 
-    `valid_to` is sound — no certification has already expired at the
+    `valid_to` is sound: no certification has already expired at the
     snapshot, and the one engineered case (a recurrent-training cert expiring
     the day before a scheduled duty) is an expiry. The answer keys only ever
     cite CERT-06 for expiry, so expiry is the rule.
@@ -278,7 +278,7 @@ def evaluate(
     """Every rule against every day of the pairing.
 
     Multi-day matters: a cover can be legal on day 1 and breach on day 2, so
-    checking only the leg in front of you is not enough.
+    checking only the leg in front of you isn't enough.
     """
     verdicts: list[RuleVerdict] = []
     for i, day in enumerate(days):
@@ -290,10 +290,10 @@ def evaluate(
             check_flight_window(crew, day, days[:i]),
             check_rest(crew, day, exclude_pairing),
         ]
-        # Base applies to the first day only: that is where the crew has to
+        # Base applies to the first day only — that's where the crew has to
         # physically get to. Later days start wherever the pairing overnighted,
-        # so checking them rejects every crew on any pairing that sleeps away
-        # from base.
+        # so checking them would reject every crew member on any pairing
+        # that sleeps away from base.
         if i == 0:
             verdicts.append(check_base(crew, day, deadhead))
     return verdicts

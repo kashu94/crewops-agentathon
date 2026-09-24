@@ -1,11 +1,11 @@
 """Hybrid (BM25 + semantic) search over the 6 engineered scenarios, to
-classify what *kind* of disruption a freeform description is -- several
-call sites elsewhere in this pipeline hardcode `event_type="SICK_CREW"`
+classify what *kind* of disruption a freeform description is. Several call
+sites elsewhere in this pipeline hardcode `event_type="SICK_CREW"`
 regardless of what actually happened, which is wrong the moment a
 controller describes a station closure or a tech delay instead.
 
 Hard boundary, not a suggestion: `answer_key` in `scenario_precedent_vec`
-is that PAST scenario's own frozen answer -- specific crew ids and costs
+is that PAST scenario's own frozen answer — specific crew ids and costs
 that were correct for that scenario's data state, not this one. This
 module returns only `event_type` (and `scenario_id`/`difficulty` for
 context) and deliberately never returns `answer_key` at all, so nothing
@@ -28,7 +28,7 @@ def enabled() -> bool:
 
 def classify_event(text: str, top_k: int = 1) -> list[dict[str, Any]]:
     """The `top_k` engineered scenarios closest to `text`, each with
-    `scenario_id`, `event_type`, `difficulty`, and `blended_score` --
+    `scenario_id`, `event_type`, `difficulty`, and `blended_score`.
     `answer_key` is intentionally excluded from what this returns."""
     if not enabled():
         return []

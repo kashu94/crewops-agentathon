@@ -7,11 +7,12 @@ own team arrived at — not a generic two-agent template, but three agents
 matched to the three points in the pipeline where a model call actually earns
 its place:
 
-- **Triage Agent** — classifies a question when ~20 ordered regex rules
-  couldn't (`router.py` settles the overwhelming majority of real questions
-  with zero model calls)
-- **Resolution Advisor Agent** — the only agent with tools, all **10** of
-  them, backed by a from-scratch port of the legality rules (7 rules), duty
+- **Triage Agent** — classifies a question when 21 ordered regex rules and a
+  semantic fallback (hybrid BM25 + embedding match against the 38 gold
+  questions) both couldn't (`router.py` settles the overwhelming majority of
+  real questions with zero model calls)
+- **Resolution Advisor Agent** — the only agent with tools, **15** of them,
+  backed by a from-scratch port of the legality rules (7 rules), duty
   arithmetic, cost model and candidate search in `challenge-1-build/core_engine/`
 - **Explainer Agent** — rewrites a verified template into controller prose,
   and is never trusted to add a fact

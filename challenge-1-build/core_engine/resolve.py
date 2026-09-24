@@ -1,16 +1,16 @@
 """Entity resolution — suggest, never substitute.
 
-When a controller types an id that is not in the database, three things must
+When a controller types an id that isn't in the database, three things must
 happen and one must not:
 
-  * say plainly that it does not exist;
+  * say plainly that it doesn't exist;
   * offer the closest real candidates, each with enough detail to recognise;
   * never fail silently, and never return an empty result as though the
     question had been answered;
   * **never quietly act on the suggestion.**
 
 That last one is the whole point. `C-1042` and `C-1024` differ by one
-transposed digit and, in this dataset, one of them is a real captain and the
+transposed digit, and in this dataset, one of them is a real captain and the
 other is nobody. Auto-correcting would silently dispatch a different human
 being to an aircraft — the exact failure this system exists to prevent. So a
 near match is returned as a *question for the controller*, never as an answer.
@@ -76,10 +76,10 @@ class Resolution:
             return text + " Confirm which and I will run it — I will not guess."
 
         if self.suggestions:
-            # Near in spelling but not a transposition. String distance cannot
+            # Near in spelling but not a transposition. String distance can't
             # separate a typo from a wrong id — C-1024/C-1042 and
-            # C-9999/C-4999 both score 0.833 — so this says what it found
-            # rather than implying a correction.
+            # C-9999/C-4999 both score 0.833 — so this just says what it
+            # found instead of implying a correction.
             nearest = ", ".join(str(s) for s in self.suggestions)
             return (f"There is no {self.kind} {self.query}, and nothing that looks "
                     f"like a typo of it. Nearest existing: {nearest}. "
@@ -103,8 +103,8 @@ def _digit_variants(value: str) -> set[str]:
     """Ids reachable by transposing digits anywhere in the numeric part.
 
     "C-1042" -> "C-1024", "C-4102", ... Controllers read these aloud and
-    mistype them constantly, and adjacent-swap alone misses the pattern where
-    two non-adjacent digits are exchanged.
+    mistype them constantly, and adjacent-swap alone misses the case where
+    two non-adjacent digits get swapped.
     """
     match = re.search(r"\d+", value)
     if not match:
@@ -123,16 +123,17 @@ def _digit_variants(value: str) -> set[str]:
 
 
 def _digit_prefix_matches(query: str, ids: list[str], limit: int) -> list[str]:
-    """Real ids sharing the longest run of leading digits with `query` --
-    the right fallback for a *wrong-length* id ("C-10" for a dataset of
-    C-#### ids), where `difflib.get_close_matches`'s whole-string ratio
+    """Real ids sharing the longest run of leading digits with `query`.
+
+    This is the right fallback for a *wrong-length* id ("C-10" for a dataset
+    of C-#### ids), where `difflib.get_close_matches`'s whole-string ratio
     penalises the length mismatch itself and returns nothing useful:
     "C-10" and "C-1042" only share 2 of 6 characters by ratio, but a
     controller who typed "C-10" almost always meant a real id that starts
-    the same way, not just one that merely differs the least. The one
-    strategy behind both `require()`'s "did you mean" and the
-    `suggest_crew_ids` tool -- shared here rather than kept as two
-    implementations that could quietly drift into disagreeing.
+    the same way, not just one that merely differs the least. This one
+    strategy backs both `require()`'s "did you mean" and the
+    `suggest_crew_ids` tool, shared here instead of kept as two
+    implementations that could quietly drift out of sync.
     """
     digits = "".join(ch for ch in query if ch.isdigit())
     if not digits:
@@ -161,7 +162,7 @@ def resolve(
     """Whether `query` names something real, and if not, what is nearest.
 
     `universe` maps id -> record; `label` renders a record so a controller can
-    recognise it. Showing "C-1024" alone is not enough to confirm against —
+    recognise it. Showing "C-1024" alone isn't enough to confirm against —
     "C-1024 (M. Rao, First Officer, DEL)" is.
     """
     ids = list(universe)
@@ -184,16 +185,16 @@ def resolve(
         offer(candidate, TRANSPOSE_CONFIDENCE)
 
     # A wrong-LENGTH id ("C-10" against 6-character real ids) goes before
-    # the general fallback below, not after: `difflib`'s whole-string ratio
+    # the general fallback below, not after. `difflib`'s whole-string ratio
     # is length-sensitive and returns *something* for almost any input
     # (never empty, just weak), so a `len(suggestions) < N` check to decide
-    # whether digit-prefix matching is even needed would never fire --
+    # whether digit-prefix matching is even needed would never fire —
     # difflib always fills the quota first, with its worse guesses.
     if not any(len(query) == len(i) for i in ids):
         for candidate in _digit_prefix_matches(query, ids, MAX_SUGGESTIONS):
             offer(candidate, CLOSE_CONFIDENCE)
 
-    # Then general nearness, for a wrong digit or a missing character --
+    # Then general nearness, for a wrong digit or a missing character.
     # `offer()` already skips anything the digit-prefix pass above found,
     # and the final `[:MAX_SUGGESTIONS]` slice below keeps those earlier,
     # more relevant candidates over whatever this adds past the cap.

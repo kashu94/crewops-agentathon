@@ -1,15 +1,15 @@
 """Tier and intent classification — the Triage Agent's job.
 
 Deterministic rules run first and settle the overwhelming majority of real
-questions (38/38 on this dataset's gold question set) with zero model calls,
-which keeps the common path free, fast and reproducible — and keeps the
+questions (38/38 on this dataset's gold question set) with zero model calls.
+That keeps the common path free, fast and reproducible, and keeps the
 classifier auditable, since every rule-based decision reports which pattern
 fired. The **Triage Agent** (`agents.py::TriageAgent`, a Foundry
 `PromptAgentDefinition` with no tools) is only consulted when every rule
 abstains.
 
-Tier comes from the intent, never independently: they cannot disagree if only
-one of them is ever decided.
+Tier always comes from the intent, never decided separately, so the two can
+never disagree.
 """
 
 from __future__ import annotations
@@ -20,7 +20,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import config
-from entities import Entities, extract
+from entities import (
+    AIRCRAFT_RE, CREW_RE, FLIGHT_ID_RE, FLIGHT_NO_RE, PAIRING_RE, RULE_RE,
+    Entities, extract,
+)
 from schemas import Confidence, Intent, Tier
 
 # --------------------------------------------------------------------------
@@ -119,9 +122,9 @@ ASKS_IMPACT_RE = _p(
     r"\bimpact\b", r"\bknock[- ]?on\b", r"\bdownstream\b",
 )
 
-# Boarding-gate vocabulary. Checked before every disruption/legality rule so
+# Boarding-gate vocabulary. Checked before every disruption/legality rule, so
 # "DX401 is delayed 90 minutes — does it still clear its gate?" routes to
-# CHECK_GATE rather than FIND_REPLACEMENT ("delayed" alone reads as a
+# CHECK_GATE instead of FIND_REPLACEMENT ("delayed" alone reads as a
 # disruption) or CHECK_LEGALITY ("exceed"/"limit" wording overlaps).
 GATE_RE = _p(r"\bgates?\b", r"\b[a-z]{3}-g\d+\b")
 
@@ -130,15 +133,15 @@ RULES: tuple[Rule, ...] = (
     # Gate questions first: distinctive vocabulary that would otherwise be
     # caught by "delayed" (disruption) or "exceed"/"limit" (legality).
     Rule(Intent.CHECK_GATE, GATE_RE, "gate"),
-    # "Controller" names the desk, never a crew member -- distinctive enough
-    # to check before anything else claims the sentence.
+    # "Controller" names the desk, never a crew member, so it's distinctive
+    # enough to check before anything else claims the sentence.
     Rule(Intent.LOOKUP_CONTROLLERS, _p(r"\bcontrollers?\b"), "controllers"),
     # ---- tier 3 -----------------------------------------------------------
     Rule(
-        # First, because "draft the callout notification" also contains
-        # "callout" — a cover request everywhere else in this table. The verb
-        # is what distinguishes them: the controller has already decided who,
-        # and wants the message written.
+        # Checked first because "draft the callout notification" also
+        # contains "callout" — a cover request everywhere else in this
+        # table. The verb is what tells them apart: here the controller has
+        # already decided who, and just wants the message written.
         Intent.DRAFT_NOTIFICATION,
         _p(r"\bdraft\b", r"\bnotification\b", r"\bnotify\b", r"\bmessage (to|for)\b",
            r"\bwrite (the |a )?(message|note|text|sms)\b", r"\binform\b",
@@ -165,11 +168,11 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         Intent.RANK_OPTIONS,
-        # Note: no bare `\brank\b` — "what is C-2087's rank" is a tier-1
-        # lookup about seniority, not a request to rank anything.
-        # Also no `\bdraft the\b` / `\bnotification\b` -- both are already
-        # caught by DRAFT_NOTIFICATION's rule above, which is checked first,
-        # so either alternative here could never be the one that wins.
+        # Note: no bare `\brank\b` here — "what is C-2087's rank" is a
+        # tier-1 lookup about seniority, not a request to rank anything.
+        # Also no `\bdraft the\b` / `\bnotification\b`, since both are
+        # already caught by DRAFT_NOTIFICATION's rule above, which runs
+        # first, so neither could ever win here anyway.
         _p(r"\branked\b", r"\brank (the |these )?options\b", r"\brank them\b",
            r"\brecommend", r"\bwhat should\b", r"\bshould (it|we|they|the desk)\b",
            r"\bbest (option|course|plan)\b", r"\bresolution options\b",
@@ -199,6 +202,31 @@ RULES: tuple[Rule, ...] = (
            r"\bclosure\b", r"\bcloses?\b.*\b\d{2}:\d{2}\b"),
         "impact",
     ),
+    Rule(
+        Intent.LOOKUP_CREW,
+        # "find me a captain who is X-rated, Y-based, under N duty hours" is
+        # a list of filter criteria, not a disruption to cover. A real cover
+        # request names what broke (DISRUPTION_RE); this doesn't, and
+        # NEEDS_COVER_RE's bare "find (me) a" alone can't tell the two apart.
+        # Checked before that rule so a filter question doesn't get treated
+        # as an assignment nobody asked for.
+        re.compile(
+            r"\bfind (?:me )?(?:a |an )?"
+            r"(?:captain|first officer|fo|pilot|crew member)\b"
+            r"[^.?!]{0,120}?\b(?:-rated|-based|duty hours?|not flying)\b",
+            re.I,
+        ),
+        "attribute-filter",
+    ),
+    Rule(
+        Intent.FIND_REPLACEMENT,
+        # "Who got excluded ... and why" asks about a replacement search's
+        # funnel, not a crew profile. Checked before the generic `\bwho\b`
+        # LOOKUP_CREW rule below, which would otherwise catch it first and
+        # route it away from the only tier that actually renders `excluded`.
+        _p(r"\bexcluded\b", r"\bwho (got |was )?(dropped|ruled out|eliminated)\b"),
+        "excluded-from-search",
+    ),
     Rule(Intent.FIND_REPLACEMENT, NEEDS_COVER_RE, "cover-request"),
     # A bare statement that someone cannot fly IS a request for cover.
     Rule(Intent.FIND_REPLACEMENT, DISRUPTION_RE, "disruption"),
@@ -227,8 +255,8 @@ RULES: tuple[Rule, ...] = (
         "explain_rule",
     ),
     Rule(
-        # Risk scores are provided input, not something modelled here — but a
-        # question about one is still a lookup, and must not fall through.
+        # Risk scores are provided input, not something modelled here, but a
+        # question about one is still a lookup and must not fall through.
         Intent.LOOKUP_RISK,
         _p(r"\brisk score\b", r"\bdisruption[- ]risk\b", r"\brisk signal",
            r"\bwhat drives\b"),
@@ -263,11 +291,12 @@ RULES: tuple[Rule, ...] = (
 )
 
 
-# Tier-1 rules that each answer ONE aspect of one crew member, and each offer a
-# single tool. A controller opening a person's file asks for several at once —
-# "duty headroom, expiring certs, and any risk" is three of these in one
-# sentence. First-match-wins gives that question the duty clock alone, and the
-# other two thirds cannot be answered because their tools were never offered.
+# Tier-1 rules that each answer ONE aspect of one crew member, each offering a
+# single tool. A controller opening a person's file often asks for several at
+# once — "duty headroom, expiring certs, and any risk" is three of these in
+# one sentence. First-match-wins would give that question the duty clock
+# alone, leaving the other two unanswered since their tools were never
+# offered.
 _PERSON_ASPECTS = frozenset({
     Intent.LOOKUP_DUTY_CLOCK,
     Intent.LOOKUP_CERT,
@@ -303,8 +332,9 @@ class Route:
 def _is_multi_event(text: str, ents: Entities) -> bool:
     """Two disruptions at once.
 
-    Two crew ids alone is not enough ("can C-1042 cover for C-2087?" names two
-    and is a single event), so require a disruption verb as well.
+    Two crew ids alone are not enough — "can C-1042 cover for C-2087?" names
+    two people but is still a single event — so a disruption verb is
+    required too.
     """
     if not DISRUPTION_RE.search(text):
         return False
@@ -350,8 +380,8 @@ def route_deterministic(text: str, ents: Entities | None = None) -> Route | None
             notes.append("upgraded to JOINT_PLAN: two concurrent events")
 
         # A question naming several aspects of one person is a dossier, not
-        # the first aspect that happened to match. Requires a crew id — "which
-        # flights are at risk" names an aspect but no person.
+        # just the first aspect that happened to match. Requires a crew id —
+        # "which flights are at risk" names an aspect but no person.
         elif intent in _PERSON_ASPECTS and ents.crew_ids:
             also = sorted(
                 rule.name for rule in RULES
@@ -387,6 +417,12 @@ Valid intents:
   Tier 3  RANK_OPTIONS SIMULATE_WHATIF JOINT_PLAN RESOLVE_ILLEGAL
 
 Entities are already extracted deterministically; classify the *kind* of ask.
+
+A bare identifier with no verb or context ("C-1042", just an id and nothing
+else) never named a disruption, a replacement need, or any other action --
+picking FIND_REPLACEMENT, RANK_OPTIONS, IMPACT_OF_EVENT or any other Tier 2/3
+intent for it invents a scenario the controller never stated. Classify it
+LOOKUP_CREW (their profile is the only thing actually asked for) instead.
 """
 
 TriageFn = Callable[[str, str], str]
@@ -398,9 +434,9 @@ def route_llm(text: str, ents: Entities, triage: TriageFn) -> Route:
     """Fallback path. Only reached when every deterministic rule abstained.
 
     Calls the Triage Agent — a `PromptAgentDefinition` with no tools — and
-    parses its JSON reply. An unparseable reply, or no Triage Agent at all,
-    degrades to the safest guess: a lookup, which reads data and changes
-    nothing.
+    parses its JSON reply. If the reply can't be parsed, or there's no
+    Triage Agent at all, this falls back to the safest guess: a lookup,
+    which reads data and changes nothing.
     """
     raw = triage(ROUTER_INSTRUCTIONS, text)
 
@@ -432,12 +468,12 @@ _QUESTION_INTENT_MAP: dict[str, Intent] | None = None
 
 def _question_intent_map() -> dict[str, Intent]:
     """`{question_id: intent}` for the 38 gold questions, built by running
-    each through `route_deterministic()` itself rather than from a second,
-    hand-maintained source of truth -- this dataset's own documented
-    property is that all 38 already classify correctly by regex alone, so
-    this is reading off an already-verified fact, not asserting a new one.
-    Built once, cached: computed from a fixed 38-row file, so it can never
-    go stale within a process lifetime."""
+    each through `route_deterministic()` itself, rather than from a second,
+    hand-maintained source of truth. This dataset's documented property is
+    that all 38 already classify correctly by regex alone, so this just
+    reads off an already-verified fact instead of asserting a new one.
+    Built once and cached — since it's computed from a fixed 38-row file,
+    it can never go stale within a process lifetime."""
     global _QUESTION_INTENT_MAP
     if _QUESTION_INTENT_MAP is None:
         mapping: dict[str, Intent] = {}
@@ -448,10 +484,28 @@ def _question_intent_map() -> dict[str, Intent]:
     return _QUESTION_INTENT_MAP
 
 
-# A semantic match this weak is worse than admitting no match at all --
-# below this, fall through to the Triage Agent (or the safe LOOKUP_CREW
-# default) rather than act on a resemblance too faint to trust.
+# A semantic match this weak is worse than admitting no match at all.
+# Below this threshold, fall through to the Triage Agent (or the safe
+# LOOKUP_CREW default) instead of acting on a resemblance too faint to trust.
 _SEMANTIC_MATCH_THRESHOLD = 0.65
+
+
+_ID_RES = (CREW_RE, PAIRING_RE, FLIGHT_ID_RE, FLIGHT_NO_RE, RULE_RE, AIRCRAFT_RE)
+
+
+def _is_bare_identifier(text: str) -> bool:
+    """True when the query is nothing but one or more ids — no verb, no
+    other words. A bare "C-1042" embeds as near-identical (0.96+) to a full
+    gold question like "Captain C-1042 is out for pairing P-2291 — produce
+    ranked resolution options", just because they share one salient token,
+    not because they ask the same *kind* of question. Semantic similarity
+    here is measuring token overlap, not question shape, so a match against
+    it can't be trusted the way an ordinary paraphrase can.
+    """
+    stripped = text
+    for pattern in _ID_RES:
+        stripped = pattern.sub("", stripped)
+    return not re.search(r"[A-Za-z]{2,}", stripped)
 
 
 def route_semantic(text: str, ents: Entities) -> Route | None:
@@ -459,12 +513,16 @@ def route_semantic(text: str, ents: Entities) -> Route | None:
     enough to borrow its intent, for phrasing no regex anticipated ("is
     captain A Nair available?" rather than "who is qualified as captain").
 
-    Entities still come from THIS text, never the matched example's --
-    matching only ever borrows *what kind* of question this is, exactly
-    the same boundary `route_llm`'s Triage Agent already respects.
-    `None` (not a guess) whenever the ledger/embedding model isn't
-    configured, or nothing clears the confidence threshold.
+    Entities still come from THIS text, never the matched example's —
+    matching only ever borrows *what kind* of question this is, the same
+    boundary `route_llm`'s Triage Agent already respects. Returns `None`
+    (not a guess) whenever the ledger/embedding model isn't configured,
+    nothing clears the confidence threshold, or the query is too bare (see
+    `_is_bare_identifier`) for similarity to mean anything.
     """
+    if _is_bare_identifier(text):
+        return None
+
     from core_engine import intent_search
 
     matches = intent_search.best_matches(text, top_k=1)
@@ -503,7 +561,7 @@ def route(text: str, triage: TriageFn | None = None) -> Route:
 
     if triage is None:
         # No Triage Agent wired up (e.g. running offline / under test):
-        # degrade to the same safe default as an unparseable reply.
+        # fall back to the same safe default used for an unparseable reply.
         return Route(
             intent=Intent.LOOKUP_CREW, tier=Tier.LOOKUP, entities=ents,
             confidence=Confidence.LOW, used_llm=False,

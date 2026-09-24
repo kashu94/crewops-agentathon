@@ -1,15 +1,13 @@
 """The trust gate.
 
-Before any answer reaches a controller, every identifier and every number in
-its prose must be traceable to something a tool actually returned. Anything
-unsupported is a hallucination by definition, because the model has no other
-source of facts.
+Every identifier and number in an answer must trace back to a real tool
+result before it reaches a controller — if it doesn't, it's a hallucination,
+since the model has no other source of facts.
 
-This is what makes the demo credible, and it is deliberately not a language
-model: it is set membership over the trace. Deterministic, fast, and it
-cannot itself hallucinate. It runs after every Explainer Agent call, and its
-rejection is what triggers the deterministic-template fallback in
-`explainer.render()`.
+This check is deterministic (plain set membership over the trace), not
+another model call, so it can't hallucinate itself. It runs after every
+Explainer Agent call; a rejection triggers the fallback to
+`explainer.render()`'s plain template.
 """
 
 from __future__ import annotations
@@ -34,9 +32,9 @@ from schemas import TraceEntry
 # Numbers as a controller would write them: 18,500 / ₹18500 / 61.33 / 1h20m
 NUMBER_RE = re.compile(r"(?<![\w.])(?:₹\s*)?(\d[\d,]*(?:\.\d+)?)(?![\w])")
 
-# Non-capturing so `findall` yields whole matches. A date is one claim, not
-# three numbers — checking 2026-09-15 as "2026" + "09" + "15" both floods the
-# ledger and lets a wrong date pass on the strength of its year.
+# Matches a whole date as one claim, not three separate numbers — splitting
+# 2026-09-15 into 2026/09/15 would let a wrong date pass just because the
+# year matches.
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 # A whole ISO timestamp, matched before anything looks for a time inside it.
@@ -45,18 +43,18 @@ ISO_DT_RE = re.compile(
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
 )
 
-# A time of day, once timestamps are out of the way. `\b` cannot open this:
-# a bare time may be preceded by `-` in a range like `06:00-18:00`.
+# A time of day, checked after full timestamps are removed. Can't start with
+# `\b` since a time may follow a `-` in a range like `06:00-18:00`.
 CLOCK_RE = re.compile(r"(?<![\d:])\d{1,2}:\d{2}(?::\d{2})?Z?(?![\d:])")
 
 
 def times_and_rest(text: str) -> tuple[list[str], str]:
-    """Times of day named by any timestamps, and the text with them removed.
+    """Pulls the time-of-day out of every timestamp, and returns the text
+    with those timestamps removed.
 
-    Used on both sides of the gate so a report time is one fact whichever way
-    it is written — the dataset stores `2026-09-15T06:00:00+00:00`, a
-    controller reads `06:00Z`, and the model turning one into the other is
-    doing its job rather than inventing something.
+    The dataset stores full timestamps (`2026-09-15T06:00:00+00:00`) but a
+    controller writes `06:00Z` — converting between the two is the model
+    doing its job, not inventing a number.
     """
     found: list[str] = []
     for match in ISO_DT_RE.findall(text):
@@ -69,8 +67,8 @@ def times_and_rest(text: str) -> tuple[list[str], str]:
 def normalise_clock(value: str) -> str | None:
     """`6:00`, `06:00Z`, `06:00:00+00:00` -> `06:00`. Anything else -> None.
 
-    Deliberately narrow on both edges: this is the one place the gate treats
-    two different strings as the same fact.
+    Deliberately narrow: this is the one place two different strings count
+    as the same fact.
 
     **Seconds are only dropped when they are zero.** `06:00:30` is not
     `06:00`. Every timestamp in this dataset ends `:00`, but the check does
@@ -98,20 +96,32 @@ ID_PATTERNS = (
     DATE_RE, CLOCK_RE,
 )
 
-# A name stated immediately before the id it belongs to -- "A. Nair
-# (C-1042)" -- in the `Initial. Surname` shape every one of this dataset's
-# 150 crew names actually has (verified: zero exceptions). This is the one
-# place a name becomes a checkable claim rather than free prose: the id
-# next to it is exactly what evidence.names_by_id below is keyed on.
+# A name right before its id, like "A. Nair (C-1042)" — every one of the
+# 150 real crew names is "Initial. Surname" (checked, no exceptions). This
+# turns a name into a checkable claim, keyed by the id next to it.
 NAME_ID_RE = re.compile(r"([A-Z]\.\s?[A-Z][a-zA-Z'-]+)\s*\((C-\d{4})\)")
 
-# A date written the way a controller writes it. `DATE_RE` above catches the
-# ISO form the tools return, but the model answers "on 15 Sep" — and the bare
-# `15` then reads as an unsourced quantity, because no tool output contains
-# the number 15 on its own.
-#
-# A calendar reference is not a claim about the world. The date itself is
-# still checked wherever it appears in ISO form.
+# A flight number named after the word "flight" (e.g. "Flight X134"). Any
+# real flight number is shaped DX### and already caught by the identifier
+# check via FLIGHT_NO_RE; this catches the ones that aren't that shape,
+# which the identifier check never looks at, so a fake "Flight X134" was
+# otherwise invisible.
+FLIGHT_MENTION_RE = re.compile(r"\bflight\s+([A-Za-z]{1,4}\d{1,4})\b", re.I)
+
+# Every real name is "Initial. Surname" (checked, no exceptions), so a full
+# first name next to a real id -- "Ananya Gupta (C-2111)" instead of
+# "A. Gupta (C-2111)" -- has to be made up. NAME_ID_RE doesn't match that
+# shape at all. Rank words are excluded from the first position so an
+# informal "Captain Nair (C-1042)" isn't flagged as an invented name.
+_RANK_WORDS = {"captain", "first", "officer", "senior", "cabin", "crew", "fo"}
+GENERAL_NAME_ID_RE = re.compile(
+    r"\b([A-Z][a-zA-Z'-]{2,}\s+[A-Z][a-zA-Z'-]+)\s*\((C-\d{4})\)")
+
+# A date written the way a controller writes it, like "15 Sep" -- DATE_RE
+# above only catches the ISO form tools return. Without this, the bare "15"
+# would look like an unsourced number, since no tool result contains a lone
+# 15. A calendar reference isn't a claim about the world; the date is still
+# checked wherever it appears in ISO form.
 PROSE_DATE_RE = re.compile(
     r"\b\d{1,2}\s*(?:st|nd|rd|th)?\s+"
     r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
@@ -120,23 +130,20 @@ PROSE_DATE_RE = re.compile(
     re.I,
 )
 
-# "in the next 30 days", "over the last 14 days" — the window the question
-# itself named, echoed back. It describes the scope of the answer, not a
-# measured value, and no tool returns it as a number to match against.
+# "in the next 30 days", "over the last 14 days" -- this echoes back the
+# window the question itself asked about. It isn't a measured value, so no
+# tool result needs to contain it.
 WINDOW_RE = re.compile(
     r"\b(?:next|last|past|coming|previous|preceding)\s+\d+\s*"
     r"(?:day|week|month|hour|hr)s?\b",
     re.I,
 )
 
-# A rule id being *cited* is not, by itself, evidence that the claim about it
-# is true — RULE-DUTY-02 appearing in a trace could mean it passed. Set
-# membership over identifiers cannot tell "RULE-DUTY-02 was mentioned" from
-# "RULE-DUTY-02 is why this fails", so a claim naming a rule alongside a
-# fail/pass verb is checked against that rule's actual status wherever the
-# trace recorded one — the one place a plausible-sounding misattribution
-# ("breaches RULE-DUTY-02" when RULE-FDP-01 was the one that failed) is
-# otherwise invisible to this gate.
+# Citing a rule id isn't proof the claim about it is true -- RULE-DUTY-02
+# appearing in the trace could just mean it passed. So a rule id paired
+# with a pass/fail word is checked against that rule's real status, to
+# catch a wrong attribution like "breaches RULE-DUTY-02" when RULE-FDP-01
+# was the one that actually failed.
 _FAIL_VERBS_RE = re.compile(
     r"\b(?:breach\w*|violat\w*|exceed\w*|illegal|fails?|failed|non-?compliant)\b", re.I)
 _PASS_VERBS_RE = re.compile(
@@ -153,9 +160,9 @@ class Claim:
     supported: bool = False
     source_tool: str | None = None
     derivation: str | None = None
-    """Set when the value was not returned by any tool but follows from two
-    that were, e.g. "24000 - 18500". The claim is still auditable: a reader
-    can check the arithmetic against numbers the tools did produce."""
+    """Set when the value wasn't returned directly but follows from two that
+    were, e.g. "24000 - 18500". Still auditable -- check the arithmetic
+    against the tools' own numbers."""
 
     @property
     def status(self) -> str:
@@ -196,11 +203,9 @@ class VerificationResult:
 
 
 def _walk(node: Any) -> Iterable[Any]:
-    """Yield every scalar in an arbitrarily nested tool result.
-
-    Collection lengths are yielded too. "12 records" is a count the explainer
-    derived from what a tool returned, not a number the model invented, so
-    the cardinality of every result is legitimate evidence.
+    """Yields every scalar inside a nested tool result, including
+    collection lengths -- "12 records" is a real count from the tool, not
+    a number the model made up, so it counts as evidence too.
     """
     if isinstance(node, dict):
         yield len(node)
@@ -226,11 +231,10 @@ def _norm_number(raw: str) -> float | None:
 
 
 def _strip_identifiers(text: str) -> str:
-    """Blank out ids before scanning for numbers.
+    """Removes ids before scanning for numbers.
 
-    Without this, "C-1042" contributes 1042 — which both invents a claim on
-    the narrative side and, worse, would let a fabricated "1042 hours" pass
-    verification on the evidence side.
+    Without this, "C-1042" would contribute the number 1042 -- inventing a
+    false claim, and worse, letting a fake "1042 hours" pass verification.
     """
     for pattern in ID_PATTERNS:
         text = pattern.sub(" ", text)
@@ -254,14 +258,13 @@ class Evidence:
     identifiers: dict[str, str] = field(default_factory=dict)  # id -> tool
     numbers: list[tuple[float, str]] = field(default_factory=list)
     rule_statuses: dict[str, set[str]] = field(default_factory=dict)
-    """rule_id -> every status ("PASS"/"FAIL") a verdict for it actually
-    carried anywhere in the trace. Populated only from dicts shaped like a
-    `RuleVerdict` (both `rule_id` and `status` present) -- see `_rule_walk`."""
+    """rule_id -> every status ("PASS"/"FAIL") seen for it anywhere in the
+    trace. Only built from dicts shaped like a `RuleVerdict` (has both
+    rule_id and status) -- see `_rule_verdicts`."""
     names_by_id: dict[str, str] = field(default_factory=dict)
-    """crew_id -> the name a tool actually returned for it. A real id with a
-    name that doesn't match this is exactly as unsourced as an invented id
-    -- the model has no other way to know anyone's name than a tool telling
-    it, the same rule that already applies to every number and id."""
+    """crew_id -> the name a tool actually gave for it. A real id with the
+    wrong name is just as unsourced as a fake id -- the model can only know
+    a name if a tool said it."""
 
     def has_identifier(self, value: str) -> str | None:
         if found := self.identifiers.get(value):
@@ -277,17 +280,14 @@ class Evidence:
         return None
 
     def derive(self, value: float) -> tuple[str, str] | None:
-        """Whether `value` follows from two evidence numbers by simple arithmetic.
+        """Whether `value` follows from two evidence numbers by simple math
+        (a difference, a total, a multiple, a percentage) -- things a
+        controller wants stated whether or not a tool computed them
+        directly. Accepted and labelled with its derivation so it stays
+        auditable against the numbers the tools did return.
 
-        A price difference, a total, a multiple, a percentage — these are
-        things a controller genuinely wants said, and a model will compute
-        them whether or not a tool did. Rejecting a correct derived value is a
-        false positive that costs as much as a false negative, so it is
-        accepted *and labelled with its derivation* — auditable against the
-        numbers the tools did return.
-
-        Deliberately narrow: pairs only, no chaining, both operands must
-        themselves be evidence.
+        Deliberately narrow: only pairs, no chaining, and both numbers must
+        already be evidence.
         """
         if abs(value) < config.VERIFIER_NUMERIC_FLOOR:
             return None
@@ -317,11 +317,10 @@ class Evidence:
 
 
 def _crew_names(node: Any) -> Iterable[tuple[str, str]]:
-    """Yield (crew_id, name) for every dict anywhere in a nested tool result
-    that carries both -- `lookup(crew)` rows, `check_legality`/`duty_clock`'s
-    own result, `find_options`'s options/excluded entries, `same_pairing`'s
-    crew_a/crew_b, `suggest_crew_ids`/`suggest_crew_names`'s candidates, all
-    already share this shape without any tool needing to change."""
+    """Yields (crew_id, name) for every dict in a nested tool result that
+    has both -- crew lookups, check_legality/duty_clock's own result,
+    find_options' options/excluded entries, and more all already share this
+    shape."""
     if isinstance(node, dict):
         if isinstance(node.get("crew_id"), str) and isinstance(node.get("name"), str):
             yield node["crew_id"], node["name"]
@@ -333,9 +332,9 @@ def _crew_names(node: Any) -> Iterable[tuple[str, str]]:
 
 
 def _rule_verdicts(node: Any) -> Iterable[tuple[str, str]]:
-    """Yield (rule_id, status) for every dict shaped like a `RuleVerdict`
-    anywhere in a nested tool result -- `check_legality`'s and
-    `find_options`'s option/excluded entries both carry these."""
+    """Yields (rule_id, status) for every dict shaped like a `RuleVerdict`
+    anywhere in a nested tool result -- check_legality and find_options'
+    entries both have these."""
     if isinstance(node, dict):
         if "rule_id" in node and "status" in node:
             yield str(node["rule_id"]), str(node["status"]).upper()
@@ -347,11 +346,10 @@ def _rule_verdicts(node: Any) -> Iterable[tuple[str, str]]:
 
 
 def build_evidence(trace: Iterable[TraceEntry]) -> Evidence:
-    """Index every scalar every tool returned.
+    """Indexes every scalar every tool returned.
 
-    Arguments are indexed too: an id the model passed *in* came from an
-    earlier result or from the controller's own question, so echoing it back
-    is fine.
+    Arguments count too: an id the model passed in came from an earlier
+    result or the controller's own question, so echoing it back is fine.
     """
     evidence = Evidence()
 
@@ -362,8 +360,8 @@ def build_evidence(trace: Iterable[TraceEntry]) -> Evidence:
             evidence.names_by_id.setdefault(crew_id, name)
 
     for entry in trace:
-        # `error` counts as evidence: it is text a tool produced, and an id it
-        # names is sourced exactly the way an id in a successful result is.
+        # An error message counts too -- it's text a tool produced, so an
+        # id it names is just as sourced as one from a successful result.
         for payload in (entry.result, entry.args, entry.error):
             if payload is None:
                 continue
@@ -417,9 +415,9 @@ def extract_claims(narrative: str) -> list[Claim]:
         value = _norm_number(raw)
         if value is None:
             continue
-        # Small integers are prose ("all 7 rules", "the 2 options"), not
-        # claims about the world. Costs, hours and counts that matter clear
-        # the floor.
+        # Small whole numbers are usually just prose ("all 7 rules", "the 2
+        # options"), not real claims. Costs, hours, and counts big enough
+        # to matter still get checked.
         if abs(value) < config.VERIFIER_NUMERIC_FLOOR and value.is_integer():
             continue
         key = ("number", raw)
@@ -436,12 +434,12 @@ def extract_claims(narrative: str) -> list[Claim]:
 
 
 def _rule_context_violations(narrative: str, evidence: Evidence) -> list[Claim]:
-    """A rule id cited with a fail verb whose evidence never showed FAIL for
-    it (or a pass verb that never showed PASS) is unsupported -- the rule id
-    itself may well be in evidence, just not for the reason claimed. This is
-    the one context-sensitive check in an otherwise pure membership test,
-    because "which rule actually caused this failure" is exactly the kind of
-    plausible-sounding misattribution this domain cannot tolerate."""
+    """A rule id cited with a fail word (or pass word) whose evidence never
+    actually showed that status is unsupported -- the rule id itself might
+    be real, just not for the reason claimed. The only context-sensitive
+    check here, because misattributing which rule failed is exactly the
+    kind of plausible-but-wrong claim this can't allow.
+    """
     violations: list[Claim] = []
     seen: set[str] = set()
     for match in RULE_RE.finditer(narrative):
@@ -461,12 +459,9 @@ def _rule_context_violations(narrative: str, evidence: Evidence) -> list[Claim]:
         if key in seen:
             continue
         seen.add(key)
-        # Not kind="identifier" -- the main loop below would then re-derive
-        # `supported` from `evidence.has_identifier(rule_id)`, which is True
-        # (the rule id genuinely was mentioned by a tool) and would silently
-        # undo this claim's whole point. "rule_context" claims are already
-        # finalised here and the loop leaves any non-"identifier" claim's
-        # `supported` flag alone (its number-parse attempt fails harmlessly).
+        # Not kind="identifier": the main loop below would look up the
+        # rule id itself (which IS real) and undo this check. Keeping it
+        # as its own kind means the main loop leaves `supported` alone.
         claim = Claim("rule_context", f"{rule_id} ({wanted.lower()})")
         claim.supported = False
         violations.append(claim)
@@ -474,14 +469,10 @@ def _rule_context_violations(narrative: str, evidence: Evidence) -> list[Claim]:
 
 
 def _crew_name_violations(narrative: str, evidence: Evidence) -> list[Claim]:
-    """A name stated next to a real crew id that no tool result ever paired
-    with that id -- because it names a different person entirely, or
-    because that id only ever appeared in the trace bare (a `pairing_crew`
-    row has a crew_id and a role, never a name). The id being real and
-    genuinely sourced is not enough: the model has no other way to know
-    anyone's name than a tool telling it, the same rule already enforced
-    for every number and id, just never checked for the one piece of
-    information a controller actually reads first.
+    """A name next to a real crew id that no tool ever paired with that id
+    -- either it's someone else's id, or the id only ever appeared bare
+    (a `pairing_crew` row has a crew_id and role, never a name). A real id
+    isn't enough -- a name only counts if a tool actually gave it.
 
     Skips any crew_id that isn't sourced at all -- a fully invented id is
     already caught by the ordinary "identifier" claim check, so this stays
@@ -489,7 +480,11 @@ def _crew_name_violations(narrative: str, evidence: Evidence) -> list[Claim]:
     """
     violations: list[Claim] = []
     seen: set[str] = set()
-    for name, crew_id in NAME_ID_RE.findall(narrative):
+    matches = list(NAME_ID_RE.findall(narrative))
+    for name, crew_id in GENERAL_NAME_ID_RE.findall(narrative):
+        if name.split()[0].lower() not in _RANK_WORDS:
+            matches.append((name, crew_id))
+    for name, crew_id in matches:
         if crew_id not in evidence.identifiers:
             continue
         if evidence.names_by_id.get(crew_id) == name:
@@ -498,16 +493,128 @@ def _crew_name_violations(narrative: str, evidence: Evidence) -> list[Claim]:
         if key in seen:
             continue
         seen.add(key)
-        # Not kind="identifier" for the same reason `_rule_context_violations`
-        # isn't: the main loop would re-derive `supported` from the crew_id
-        # alone (True, it is real) and silently undo this claim.
+        # Not kind="identifier", same reason as above: the main loop would
+        # re-derive `supported` from the crew_id alone (real) and undo this.
         claim = Claim("crew_name", f"{name} ({crew_id})")
         claim.supported = False
         violations.append(claim)
     return violations
 
 
-def verify(narrative: str, trace: Iterable[TraceEntry]) -> VerificationResult:
+def _malformed_flight_violations(narrative: str) -> list[Claim]:
+    """A flight number named after the word "flight" that isn't shaped like
+    a real one (DX + 3 digits) at all -- see `FLIGHT_MENTION_RE`."""
+    violations: list[Claim] = []
+    seen: set[str] = set()
+    for token in FLIGHT_MENTION_RE.findall(narrative):
+        upper = token.upper()
+        if FLIGHT_NO_RE.fullmatch(upper) or upper in seen:
+            continue
+        seen.add(upper)
+        claim = Claim("flight_no", upper)
+        claim.supported = False
+        violations.append(claim)
+    return violations
+
+
+_UNCREWED_RE = re.compile(r"\buncrewed\b", re.I)
+
+
+def _uncrewed_claim_violations(narrative: str, trace: list[TraceEntry]) -> list[Claim]:
+    """"Uncrewed" is `ripple`'s own word. Using it without a `ripple` call
+    means the draft invented an impact story -- e.g. turning a single
+    person's rule failure from `check_legality` into "Flight X is
+    uncrewed... cascading risk." Since none of that is an id or a number,
+    nothing else here would catch it.
+    """
+    if not _UNCREWED_RE.search(narrative):
+        return []
+    if any(e.tool == "ripple" and not e.error for e in trace):
+        return []
+    claim = Claim("uncrewed_claim", "uncrewed")
+    claim.supported = False
+    return [claim]
+
+
+_COUNT_ASSERTION_RE = re.compile(
+    r"\b(\d[\d,]*)\s+(?:captains?|first officers?|pilots?|crew(?: members?)?|"
+    r"cabin crew|senior cabin crew|pairings?|flights?|records?|options?|"
+    r"gates?|rules?)\b", re.I)
+
+
+def _count_violations(narrative: str, trace: list[TraceEntry]) -> list[Claim]:
+    """The first stated headcount ("There are 26 captains...") must match
+    how many rows a `lookup` actually returned.
+
+    Without this, a wrong count can pass just because it coincidentally
+    matches some unrelated field among dozens of rows -- a real tool once
+    returned 27 captains while a draft said "26," and passed anyway,
+    because 26 happened to be someone's seniority elsewhere in that result.
+
+    Only checks the first such number -- a later subset count ("of these,
+    N are ATR-rated") needs its own filtered lookup, which this doesn't
+    assume exists.
+    """
+    row_counts = {len(e.result) for e in trace
+                  if e.tool == "lookup" and isinstance(e.result, list) and e.result}
+    if not row_counts:
+        return []
+    match = _COUNT_ASSERTION_RE.search(narrative)
+    if not match:
+        return []
+    n = _norm_number(match.group(1))
+    if n is None or n in row_counts:
+        return []
+    claim = Claim("headcount", match.group(0).strip())
+    claim.supported = False
+    return [claim]
+
+
+def _enumerable_id_fields(answer: Any) -> list[tuple[str, list[str]]]:
+    """The `ReplacementAnswer` fields that ARE the direct answer to a
+    question -- "who got excluded," "which flights are uncrewed." Leaves
+    out `rows`/`options` on purpose, since those can legitimately be a
+    subset or a bare count depending on how the question was asked.
+    """
+    out: list[tuple[str, list[str]]] = []
+    if answer is None:
+        return out
+    excluded = getattr(answer, "excluded", None)
+    if excluded:
+        ids = [e.get("crew_id") for e in excluded
+               if isinstance(e, dict) and e.get("crew_id")]
+        if ids:
+            out.append(("excluded", ids))
+    for field_name in ("uncovered_flights", "at_risk_flights"):
+        flights = getattr(answer, field_name, None)
+        if flights:
+            out.append((field_name, list(flights)))
+    return out
+
+
+def _completeness_violations(narrative: str, answer: Any) -> list[Claim]:
+    """Every id in `_enumerable_id_fields` must actually be named in the
+    narrative -- not just some of them.
+
+    The ordinary identifier check can't catch this: 4 real names out of 22
+    excluded candidates passes cleanly, since each of the 4 really is real.
+    Omitting isn't fabricating, so only a count comparison catches it.
+    """
+    violations: list[Claim] = []
+    for field_name, ids in _enumerable_id_fields(answer):
+        if len(ids) < 2:
+            continue
+        mentioned = sum(1 for i in ids if i in narrative)
+        if mentioned < len(ids):
+            claim = Claim("completeness",
+                          f"{field_name}: named {mentioned}/{len(ids)}")
+            claim.supported = False
+            violations.append(claim)
+    return violations
+
+
+def verify(narrative: str, trace: Iterable[TraceEntry],
+           answer: Any = None) -> VerificationResult:
     """Check a drafted answer against the tools that produced it.
 
     >>> from schemas import TraceEntry
@@ -522,6 +629,10 @@ def verify(narrative: str, trace: Iterable[TraceEntry]) -> VerificationResult:
     claims = extract_claims(narrative)
     claims += _rule_context_violations(narrative, evidence)
     claims += _crew_name_violations(narrative, evidence)
+    claims += _malformed_flight_violations(narrative)
+    claims += _uncrewed_claim_violations(narrative, trace)
+    claims += _count_violations(narrative, trace)
+    claims += _completeness_violations(narrative, answer)
 
     for claim in claims:
         if claim.kind == "identifier":

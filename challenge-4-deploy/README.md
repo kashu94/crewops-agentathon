@@ -15,8 +15,7 @@ By the end of this challenge, you will have:
 
 ## Two orchestration patterns
 
-`deploy.py` demonstrates both, the same way the other scenarios in this repo
-do:
+`deploy.py` demonstrates both:
 
 **Part A — sequential SDK orchestration.** Plain Python calls each agent in
 turn and puts the deterministic verifier gate *between* the tool loop and the

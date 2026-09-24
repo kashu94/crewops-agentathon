@@ -7,8 +7,7 @@ ranking, cross-disruption contention across multiple controllers, and a real
 commit that writes into the shared Postgres schema.
 
 This isn't part of the Microsoft challenge-0..4 track (that stays CLI/agent
-only, matching the lab template). It's an additional demo surface for the
-same backend.
+only). It's an additional demo surface for the same backend.
 
 ## What it demonstrates
 

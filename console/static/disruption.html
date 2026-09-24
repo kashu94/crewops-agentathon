@@ -44,7 +44,7 @@ function fmtTime(iso) {
 // Flights/Duty periods/Crew/Gates/Reserve capacity accordions -- all read
 // straight off `d.requirement`, which server.py builds from the same
 // vendored dataset `find_options` already reasons over. No figure here is
-// invented for display; a number the dataset genuinely doesn't have (a real
+// made up for display; a number the dataset genuinely doesn't have (a real
 // passenger/booking count) is simply left out.
 function renderRequirement(d) {
   const r = d.requirement;
@@ -139,12 +139,12 @@ function renderRequirement(d) {
   `;
 }
 
-// The rich, per-option contention view -- every contended option gets its
-// own line naming which desk's disruption also wants that crew member, on
-// which pairing, at what rank there. "Your own desk" only when the OTHER
-// disruption's opener is this tab's own controller; the ledger's
-// `opened_by` on `open_disruptions` is what makes that distinction real
-// rather than a guess.
+// The per-option contention view -- every contended option gets its own
+// line naming which desk's disruption also wants that crew member, on
+// which pairing, at what rank there. "Your own desk" shows only when the
+// OTHER disruption's opener is this tab's own controller; the ledger's
+// `opened_by` on `open_disruptions` is what makes that call real, not
+// a guess.
 function renderContention(d) {
   if (!d.contention_summary) return "";
   const me = getController();
@@ -192,10 +192,10 @@ function renderContention(d) {
 }
 
 // The Balanced card's own reasoning, in the reference UI's shape: a
-// one-line "why" (already computed by port.py, not invented for display),
+// one-line "why" (already computed by port.py, not made up for display),
 // the cost premium over the cheapest legal option, and the runner-up. No
 // policy-document quotation is shown here -- this build has no such
-// document to cite, and inventing one would be exactly the kind of
+// document to cite, and making one up would be exactly the kind of
 // unsourced claim `verifier.py` exists to catch everywhere else.
 function renderPolicyExplain(d) {
   const balanced = d.policies && d.policies.balanced;
@@ -285,13 +285,13 @@ function render() {
     for (const key of ["balanced", "cheapest", "fastest", "most_resilient"]) {
       const p = d.policies[key];
       if (!p) continue;
-      // Only "Balanced" is ever green -- that is the platform's own
-      // recommendation, a fixed fact about this disruption, not a function
-      // of what the controller happens to be looking at. Clicking a
+      // Only "Balanced" is ever green -- that's the platform's own
+      // recommendation, a fixed fact about this disruption, not something
+      // that changes with what the controller is looking at. Clicking a
       // different card changes what "Approve & commit" will act on, shown
       // with its own, separate "chosen" marker -- otherwise two cards that
       // recommend the same crew member (Balanced and Most Resilient often
-      // do) would both light up green, which looks like a bug, not a tie.
+      // do) would both turn green, which looks like a bug, not a tie.
       const isRecommended = key === "balanced";
       const isChosen = !isRecommended && p.crew_id === selected;
       const cls = isRecommended ? "recommended" : isChosen ? "chosen" : "";
@@ -354,9 +354,9 @@ function render() {
                   ? `<span class="taken-by-tag">taken by ${escapeHtml(e.taken_by.committed_by)}</span>`
                   : "";
                 const ruleTags = e.taken_by
-                  ? ""  // the rule tag ("RULE-REST-04") is technically correct but
-                        // "taken by X" already says the more useful thing -- showing
-                        // both makes an already-explained exclusion look unresolved.
+                  ? ""  // the rule tag ("RULE-REST-04") is correct but "taken by X"
+                        // already says the useful part -- showing both makes an
+                        // already-explained exclusion look unresolved.
                   : (e.rules || []).map((r) => `<span class="rule-tag">${r}</span>`).join("");
                 return `<tr class="excluded"><td>${escapeHtml(e.name)} (${escapeHtml(e.crew_id)})</td>
                    <td>${escapeHtml(e.reason)} ${ruleTags}${takenTag}</td></tr>`;
@@ -398,9 +398,9 @@ function render() {
     card.addEventListener("click", () => {
       selected = card.dataset.crew;
       // A full re-render, not a class toggle: whether a card shows the
-      // "chosen" marker depends on which OTHER card is Balanced too (a
-      // click can only ever add a marker to a non-Balanced card), which is
-      // simplest to just recompute the same way the initial render did.
+      // "chosen" marker also depends on which card is Balanced (a click
+      // can only add a marker to a non-Balanced card) -- simplest to just
+      // recompute the same way the initial render did.
       render();
     });
   });

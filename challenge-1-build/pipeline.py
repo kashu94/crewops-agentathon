@@ -5,21 +5,25 @@ the Resolution Advisor Agent's tool loop, and the Explainer Agent.
 
 None of this is a model call. `seed_calls()` and `followup_calls()` turn the
 entities the router already extracted into the tool calls a controller's
-question obviously needs, before the Resolution Advisor Agent is consulted at
-all — which saves a round trip and guarantees the model sees real data before
-it says anything. `build_answer()` folds the resulting trace into the typed
-answer object that `explainer.render()` turns into prose.
+question obviously needs, before the Resolution Advisor Agent is even
+consulted. That saves a round trip and guarantees the model sees real data
+before it says anything. `build_answer()` folds the resulting trace into the
+typed answer object that `explainer.render()` turns into prose.
 """
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import date, timedelta
 from typing import Any
 
 import config
-from entities import stated_bases, stated_ranks, stated_rank_names, stated_ratings
+from entities import (
+    extract, stated_bases, stated_pairing_dates, stated_pairing_days,
+    stated_ranks, stated_rank_names, stated_ratings,
+)
 from router import Route
 from tools import crew_named
 from schemas import (
@@ -57,7 +61,7 @@ MISSING_FOR_INTENT: dict[Intent, str] = {
     Intent.EXPLAIN_RULE: "a rule id, e.g. RULE-DUTY-02",
     Intent.LOOKUP_DUTY_CLOCK: "a crew id, e.g. C-1042",
     Intent.CHECK_GATE: "a flight (id, or number with date) and/or a boarding gate number",
-    # An unfiltered crew lookup is 150 rows, which is not an answer to
+    # An unfiltered crew lookup returns 150 rows, which doesn't answer
     # anything a controller actually asked.
     Intent.LOOKUP_CREW: ("something to narrow by — a crew id, a rank, a base, "
                          "or an aircraft rating"),
@@ -67,10 +71,11 @@ MISSING_FOR_INTENT: dict[Intent, str] = {
 def explain_no_tools(route: Route) -> str:
     """Why nothing ran — never an empty answer.
 
-    An empty trace with an empty answer object reads to a controller as "no
-    data was returned", which is indistinguishable from "nothing is wrong" —
-    the one outcome this system must never produce. So an empty trace reports
-    what was understood, what is missing, and what would unblock it.
+    An empty trace with an empty answer object would read to a controller as
+    "no data was returned", which is indistinguishable from "nothing is
+    wrong" — the one outcome this system must never produce. So an empty
+    trace instead reports what was understood, what is missing, and what
+    would unblock it.
     """
     ents = route.entities.to_dict()
     lines = [f"I read this as {str(route.intent).replace('_', ' ').lower()} "
@@ -97,8 +102,8 @@ def explain_no_tools(route: Route) -> str:
 def _flight_filters(ents: Any) -> dict[str, Any]:
     """Build a flight filter, honouring a destination when one is named.
 
-    "BLR->BOM" names two stations. Filtering on the first alone returns every
-    departure from BLR and silently drops half the question.
+    "BLR->BOM" names two stations. Filtering on the first alone would return
+    every departure from BLR and silently drop half the question.
     """
     filters: dict[str, Any] = {}
     if ents.stations:
@@ -133,10 +138,10 @@ def _crew_filters(ents: Any) -> dict[str, Any]:
 def _cert_filters(ents: Any) -> dict[str, Any]:
     """Build a certification filter, turning "within 30 days" into an interval.
 
-    An expiry question is an interval, not a point. Computing that window here
-    keeps the selection below the trust boundary; the alternative is handing
-    the model 600 rows and asking it to pick the right ones, which is exactly
-    the arithmetic it must never do.
+    An expiry question is about a date range, not a single point. Computing
+    that range here keeps the selection below the trust boundary — the
+    alternative is handing the model 600 rows and asking it to pick the
+    right ones, which is exactly the arithmetic it must never do.
     """
     filters: dict[str, Any] = {}
     if ents.primary_crew:
@@ -154,12 +159,13 @@ def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
     """First tool calls implied by the entities, before the model is consulted.
 
     The router already extracted the ids deterministically, so for the common
-    shapes we know the opening move. This saves a round-trip and guarantees
-    the model sees real data before it says anything.
+    question shapes we already know the opening move. This saves a
+    round-trip and guarantees the model sees real data before it says
+    anything.
 
-    `query` is the controller's raw text -- only needed for EXPLAIN_RULE's
-    no-rule-id fallback (search_rules() has no id to work from, only the
-    question itself). Every other case here works from `route.entities`
+    `query` is the controller's raw text. It's only needed for EXPLAIN_RULE's
+    no-rule-id fallback, since search_rules() has no id to work from, just
+    the question itself. Every other case here works from `route.entities`
     alone, same as before this parameter existed.
     """
     ents = route.entities
@@ -168,17 +174,26 @@ def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
     def add(name: str, **args: Any) -> None:
         calls.append(ToolCall(id=f"seed-{len(calls)}", name=name, args=args))
 
+    # Malformed pairing/flight ids are a cross-cutting concern -- they can
+    # show up under any intent, not just one -- so they're checked here,
+    # before the intent-specific cases below, the same way a malformed crew
+    # id seeds `suggest_crew_ids` regardless of what else the question asks.
+    if ents.malformed_pairing_ids:
+        add("suggest_pairing_ids", near=ents.malformed_pairing_ids[0])
+    if ents.malformed_flight_nos:
+        add("suggest_flight_nos", near=ents.malformed_flight_nos[0])
+
     match route.intent:
         case Intent.EXPLAIN_RULE if ents.rule_ids:
             for rule_id in ents.rule_ids:
                 add("explain_rule", rule_id=rule_id)
 
         case Intent.EXPLAIN_RULE if query:
-            # No rule id named -- a paraphrase ("can duty run long on a
-            # short day"). search_rules() is a real hybrid-search tool
-            # call, not a guess: it returns [] (not a wrong answer) if the
-            # ledger or embedding model isn't configured, same discipline
-            # as every other Postgres-backed feature in this repo.
+            # No rule id named — a paraphrase ("can duty run long on a
+            # short day"). search_rules() is a real hybrid-search tool call,
+            # not a guess: it returns [] (not a wrong answer) if the ledger
+            # or embedding model isn't configured, same as every other
+            # Postgres-backed feature in this repo.
             add("search_rules", query=query)
 
         case Intent.LOOKUP_DUTY_CLOCK if ents.primary_crew:
@@ -204,28 +219,28 @@ def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
                 at_utc=at_utc)
 
         case Intent.CHECK_GATE:
-            # No flight or gate named -- an aggregate question ("how many
+            # No flight or gate named — an aggregate question ("how many
             # boarding gates are there", or, with a date, "how many were
             # occupied on 16 Sep"). Any station or date the question DID
-            # name still scopes the aggregate -- "how many gates does
-            # Bangalore occupy" silently answering for every station would
-            # be a different, wrong-looking number. check_gate() returns
-            # real counts from the dataset either way (see
-            # core_engine/port.py), so this still answers from real data
-            # instead of falling through to explain_no_tools()'s "I need a
-            # flight or gate" decline for a question that was never about
-            # one specific gate.
+            # name still scopes the aggregate; answering "how many gates
+            # does Bangalore occupy" for every station would give a
+            # different, wrong-looking number. check_gate() returns real
+            # counts from the dataset either way (see core_engine/port.py),
+            # so this still answers from real data instead of falling
+            # through to explain_no_tools()'s "I need a flight or gate"
+            # decline — which would be wrong for a question that was never
+            # about one specific gate.
             add("check_gate",
                 station=ents.stations[0] if ents.stations else None,
                 date=ents.primary_date)
 
-        # Deliberately no seed here for Intent.LOOKUP_CONTROLLERS: whether
+        # Deliberately no seed here for Intent.LOOKUP_CONTROLLERS. Whether
         # the question needs the roster (list_controllers) or the workload
         # (controller_issue_counts) is a real choice between two tools with
-        # different meanings, not a fact the entities already pinned down --
-        # exactly the kind of decision the Resolution Advisor Agent's own
-        # tool loop exists to make, not something to pre-empt with a second
-        # keyword regex here.
+        # different meanings, not something the entities already pinned
+        # down. That's exactly the kind of decision the Resolution Advisor
+        # Agent's own tool loop exists to make, not something to pre-empt
+        # with a second keyword regex here.
 
         case Intent.LOOKUP_CERT:
             add("lookup", entity="certifications", filters=_cert_filters(ents))
@@ -238,9 +253,9 @@ def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
             add("lookup", entity="crew", filters=_crew_filters(ents))
 
         case Intent.LOOKUP_CREW if ents.malformed_crew_ids:
-            # "C-10" isn't a real id shape -- nothing to look up, but real
-            # neighbours are, so the answer can offer them instead of
-            # reading as though nothing was asked at all.
+            # "C-10" isn't a real id shape, so there's nothing to look up —
+            # but real neighbours are, so we can offer them instead of
+            # acting as though nothing was asked at all.
             add("suggest_crew_ids", near=ents.malformed_crew_ids[0])
 
         case Intent.LOOKUP_ROSTER if ents.primary_pairing:
@@ -249,6 +264,21 @@ def seed_calls(route: Route, query: str = "") -> list[ToolCall]:
 
         case Intent.LOOKUP_ROSTER if ents.primary_crew:
             add("lookup", entity="pairing_crew", filters={"crew_id": ents.primary_crew})
+
+        case Intent.LOOKUP_ROSTER if ents.aircraft and ents.primary_date:
+            # "the Senior Cabin Crew on VT-DXB's pairing on 2026-09-16"
+            # names an aircraft and a date, not a pairing or crew id.
+            # lookup()'s own aircraft+date resolution (core_engine.port)
+            # finds the right pairing; passing role too (when the
+            # question names one) narrows straight to the answer instead
+            # of the model getting back a whole crew list and having to
+            # pick the right row out of it itself.
+            filters: dict[str, Any] = {
+                "aircraft": ents.aircraft[0], "date": ents.primary_date,
+            }
+            if ents.roles:
+                filters["role"] = ents.roles[0]
+            add("lookup", entity="pairing_crew", filters=filters)
 
         case Intent.DRAFT_NOTIFICATION if ents.primary_crew and ents.primary_pairing:
             add("notification_brief",
@@ -302,8 +332,8 @@ def followup_calls(route: Route, trace: list[TraceEntry]) -> list[ToolCall]:
 
     A disruption named by route — "captain of BLR->BOM is out" — needs a leg
     identified before cover can be found. The seed does that lookup, and the
-    flight id is then sitting in the trace; asking the model to carry it
-    across is asking it to do bookkeeping it is bad at.
+    flight id then sits in the trace. Asking the model to carry it across
+    would ask it to do bookkeeping it's bad at.
     """
     if route.intent not in (Intent.FIND_REPLACEMENT, Intent.RANK_OPTIONS):
         return []
@@ -355,17 +385,46 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
     results = {e.tool: e.result for e in trace if e.result is not None}
 
     if route.intent is Intent.CHECK_GATE:
-        # A single fact-check, not a listing: the seed's call is the one that
-        # actually answers the literal question (its args come from the
-        # parsed question), so it wins over anything the model re-ran later
-        # with different arguments -- including when the seed's call is the
-        # one that *failed* (e.g. a date outside the dataset). Skipping past
-        # that error to any later, differently-scoped success would present
-        # an answer to a question nobody asked as though it answered the one
-        # that was asked; an empty answer here instead falls through to
+        # A single fact-check, not a listing. The seed's call is the one
+        # that actually answers the literal question (its args come from
+        # the parsed question), so it wins over anything the model re-ran
+        # later for a DIFFERENT flight — including when the seed's call is
+        # the one that *failed* (e.g. a date outside the dataset). Skipping
+        # past that error to a later, differently-scoped success would
+        # present an answer to a question nobody asked as if it answered the
+        # real one; an empty answer here instead falls through to
         # `render_unavailable()`, which surfaces the seed call's real error.
-        first_entry = next((e for e in trace if e.tool == "check_gate"), None)
-        first = first_entry.result if first_entry and not first_entry.error else None
+        #
+        # But a later call for the SAME flight is a refinement, not a
+        # different question. The seed's own parse of "30 minutes late"
+        # often can't extract delay_minutes, so its baseline probe comes
+        # back delay_minutes=0 (no conflict, by construction), while the
+        # model's own follow-up adds the delay the question was actually
+        # about. That refinement must win, or the real question never gets
+        # answered even though the right tool call is sitting right there.
+        gate_entries = [e for e in trace if e.tool == "check_gate"]
+        first_entry = gate_entries[0] if gate_entries else None
+        chosen = first_entry
+        if first_entry and not first_entry.error:
+            seed_flight = first_entry.result.get("flight_id")
+            same_flight = [
+                e for e in gate_entries
+                if seed_flight and not e.error and e.result
+                and e.result.get("flight_id") == seed_flight
+            ]
+            if same_flight:
+                chosen = same_flight[-1]
+            elif len(gate_entries) > 1 and gate_entries[-1].error:
+                # The seed's own aggregate succeeded, but the model tried
+                # again with something more specific (an instant, a gate)
+                # that the seed's parse never captured — and THAT attempt is
+                # what failed. Keeping the seed's coarser answer here would
+                # hide the real problem (e.g. a malformed time) behind an
+                # answer to an easier question than the one actually asked.
+                # An empty answer instead falls through to
+                # `render_unavailable()`, surfacing that real error.
+                chosen = gate_entries[-1]
+        first = chosen.result if chosen and not chosen.error else None
         return LookupAnswer(rows=[first] if first else [])
 
     if route.intent is Intent.DRAFT_NOTIFICATION:
@@ -376,22 +435,23 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
             message=notify.render(brief) if brief else "", brief=brief)
 
     if "same_pairing" in results:
-        # A verdict, not a listing -- same failure mode as CHECK_GATE above.
+        # A verdict, not a listing — same failure mode as CHECK_GATE above.
         # The model often runs an exploratory `lookup` (e.g. "list all
-        # Captains") before or after the decisive call, and folding both
-        # into one rows list risks the actual verdict getting pushed past
+        # Captains") before or after the decisive call. Folding both into
+        # one rows list risks the actual verdict getting pushed past
         # ROW_LIMIT by an unrelated large table and silently truncated out
         # of what the Explainer ever sees.
         return LookupAnswer(rows=[results["same_pairing"]])
 
     if "suggest_crew_ids" in results:
-        # A "did you mean" list, not a set of matches -- none of these rows
-        # answer the question that named the malformed id, they're
+        # A "did you mean" list, not a set of matches. None of these rows
+        # answer the question that named the malformed id — they're
         # candidates for the controller to pick from. A bare table of
-        # real-looking crew rows with nothing saying so reads as "here are
-        # the matches" to the Explainer, which then (correctly, given what
-        # it was shown) summarizes it as "the id isn't in the data" -- true,
-        # but throwing away the one useful thing this tool call was for.
+        # real-looking crew rows with nothing saying so would read as "here
+        # are the matches" to the Explainer, which would then (correctly,
+        # given what it was shown) summarize it as "the id isn't in the
+        # data" — true, but throwing away the one useful thing this tool
+        # call was for.
         malformed = route.entities.malformed_crew_ids
         return LookupAnswer(rows=[{
             "requested_id": malformed[0] if malformed else None,
@@ -399,15 +459,34 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
             "nearest_real_crew_ids": results["suggest_crew_ids"] or [],
         }])
 
+    if "suggest_pairing_ids" in results:
+        # Same reasoning as `suggest_crew_ids` above, for a malformed
+        # pairing id instead of a crew id.
+        malformed = route.entities.malformed_pairing_ids
+        return LookupAnswer(rows=[{
+            "requested_id": malformed[0] if malformed else None,
+            "exists_in_dataset": False,
+            "nearest_real_pairing_ids": results["suggest_pairing_ids"] or [],
+        }])
+
+    if "suggest_flight_nos" in results:
+        # Same reasoning again, for a malformed flight number.
+        malformed = route.entities.malformed_flight_nos
+        return LookupAnswer(rows=[{
+            "requested_flight_no": malformed[0] if malformed else None,
+            "exists_in_dataset": False,
+            "nearest_real_flight_nos": results["suggest_flight_nos"] or [],
+        }])
+
     if "search_rules" in results:
         # A paraphrased rule question can land on almost any intent
         # depending on its wording ("how long do crew have to rest between
         # duties" reads as CHECK_LEGALITY to the router's own regex, not
-        # EXPLAIN_RULE), so the tier-specific branches below -- keyed to
-        # what a *legality* or *lookup* question needs -- never think to
-        # look for this tool's result at all, even though it ran and
-        # succeeded. Surfaced here unconditionally so a real answer never
-        # gets silently dropped just because the intent guess was off.
+        # EXPLAIN_RULE). The tier-specific branches below, keyed to what a
+        # *legality* or *lookup* question needs, would never think to look
+        # for this tool's result at all, even though it ran and succeeded.
+        # Surfaced here unconditionally so a real answer never gets silently
+        # dropped just because the intent guess was off.
         return LookupAnswer(rows=results["search_rules"] or [])
 
     if route.tier is Tier.LOOKUP:
@@ -431,8 +510,8 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
     if route.tier is Tier.REPLACEMENT:
         found = results.get("find_options") or {}
         rippled = results.get("ripple") or {}
-        # A legality verdict is a complete answer on its own — "does any rule
-        # breach?" computes the right verdict and must not report nothing
+        # A legality verdict is a complete answer on its own. "Does any rule
+        # breach?" computes the right verdict, and must not report nothing
         # just because find_options/ripple never ran.
         checked = results.get("check_legality") or {}
         rec = _coerce(Option, [found["recommended"]]) if found.get("recommended") else []
@@ -469,15 +548,17 @@ def build_answer(route: Route, trace: list[TraceEntry]) -> Any:
 
 
 def stated_attribute_mismatch(query: str, port: Any) -> str | None:
-    """An attribute the query asserts about a named crew member that the
-    roster contradicts -- rank, base, or aircraft rating.
+    """Something the query states that isn't true, checked before any
+    tool runs -- a crew member's rank/base/rating, a pairing's real dates,
+    or (see the bottom) a station code that doesn't exist.
 
     A controller typing "FO C-2087" when the roster says C-2087 is a
     Captain, or "the DEL-based C-1042" when C-1042 is BLR-based, has either
-    misremembered or means a different person, and both change the answer.
-    Accepting it silently is the failure; the roster knows, so it should
-    say -- the same check, just not limited to rank, the one attribute this
-    used to be scoped to (the function was named `rank_mismatch`).
+    misremembered or means a different person — either way it changes the
+    answer. Silently accepting it would be the failure; the roster knows,
+    so it should say. This is the same check as before, just no longer
+    limited to rank, the one attribute it used to be scoped to (the
+    function was named `rank_mismatch`).
     """
     for crew_id, claimed in stated_ranks(query):
         try:
@@ -499,7 +580,7 @@ def stated_attribute_mismatch(query: str, port: Any) -> str | None:
             continue
         if not matches or any(m.get("rank") == claimed for m in matches):
             # No one by that name at all is a different tool's problem to
-            # report; at least one real match holding the claimed rank means
+            # report. If at least one real match holds the claimed rank,
             # this isn't a mismatch, even if a same-named person elsewhere
             # holds a different one.
             continue
@@ -534,4 +615,42 @@ def stated_attribute_mismatch(query: str, port: Any) -> str | None:
             return (f"{crew_id} is rated on {have}, not {claimed}. "
                     f"Did you mean a different crew member, or shall I "
                     f"proceed with {crew_id} as {have}-rated?")
+
+    for pairing_id, claimed_date in stated_pairing_dates(query):
+        try:
+            rows = port.lookup("pairing_days", {"pairing_id": pairing_id})
+        except Exception:
+            continue
+        if not rows:
+            continue
+        if not any(r["date"] == claimed_date for r in rows):
+            real_dates = ", ".join(sorted(r["date"] for r in rows))
+            return (f"{pairing_id} doesn't run on {claimed_date} -- it runs "
+                    f"{real_dates}. Did you mean one of those, or a "
+                    f"different pairing?")
+
+    for pairing_id, claimed in stated_pairing_days(query):
+        try:
+            rows = port.lookup("pairing_days", {"pairing_id": pairing_id})
+        except Exception:
+            continue
+        if not rows:
+            continue
+        actual = len(rows)
+        if actual != claimed:
+            return (f"{pairing_id} is a {actual}-day pairing, not "
+                    f"{claimed}-day -- it runs "
+                    f"{', '.join(sorted(r['date'] for r in rows))}. "
+                    f"Shall I proceed on that basis?")
+
+    if malformed := extract(query).malformed_stations:
+        token = malformed[0]
+        suggestion = difflib.get_close_matches(token, config.STATIONS, n=1)
+        if suggestion:
+            return (f"{token!r} isn't a real station -- did you mean "
+                    f"{suggestion[0]}? Confirm which, or rephrase without it.")
+        return (f"{token!r} isn't a real station (real ones: "
+                f"{', '.join(sorted(config.STATIONS))}). Confirm what you "
+                f"meant, or rephrase without it.")
+
     return None
