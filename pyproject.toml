@@ -1,0 +1,20 @@
+[project]
+name = "crewops-console"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Runtime-only subset of the repo's own requirements.txt -- pytest,
+# azure-ai-evaluation and aiohttp are dev/eval tooling `console/app.py`'s
+# own import chain never touches, and trimming them keeps `uv lock` fast
+# and the deployed function small. requirements.txt stays the source of
+# truth for local dev/CI; this list is deliberately narrower, not a fork.
+dependencies = [
+  "azure-ai-projects>=2.0.0",
+  "azure-ai-agents>=1.1.0",
+  "azure-identity>=1.15.0",
+  "python-dotenv>=1.0.0",
+  "openai",
+  "psycopg[binary]>=3.1.0",
+]
+
+[tool.vercel]
+entrypoint = "console.app:Handler"

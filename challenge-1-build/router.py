@@ -269,7 +269,10 @@ RULES: tuple[Rule, ...] = (
            r"\bwhich aircraft (operates|flies)\b", r"\bblock time\b",
            r"\bdepartures?\b", r"\barrivals?\b", r"\bschedule\b",
            r"\bstations?\b.*\b(serve|network|nonstop|non-stop)\b",
-           r"\bnetwork\b", r"\bnonstop\b", r"\bnon-stop\b", r"\broutes?\b"),
+           r"\bnetwork\b", r"\bnonstop\b", r"\bnon-stop\b", r"\broutes?\b",
+           # A bare "flights before/after/between <date>" with no "which" or
+           # "how many" in front -- same intent, just phrased as a fragment.
+           r"\bflights?\b.{0,25}\b(before|after|since|between|on or (before|after))\b"),
         "flight",
     ),
     Rule(

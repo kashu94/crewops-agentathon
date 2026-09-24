@@ -143,6 +143,11 @@ class Entities:
     the one asked. Candidates for a "did you mean" suggestion, never a
     silent substitution."""
     dates: list[str] = field(default_factory=list)
+    date_range: dict[str, str] | None = None
+    """A `{"lt"/"lte"/"gt"/"gte": iso_date}` (or both a `gte` and `lte` for
+    "between") pulled from a comparison word next to a date -- "before",
+    "after", "since", "on or before", "between X and Y". `None` means the
+    question named a date with no comparison word, i.e. an exact-day ask."""
     times: list[str] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
     cert_types: list[str] = field(default_factory=list)
@@ -233,6 +238,37 @@ def extract_dates(text: str) -> list[str]:
         found.append(date.today().isoformat())
 
     return _dedupe(found)
+
+
+_BETWEEN_RE = re.compile(r"\bbetween\b", re.I)
+# Longest phrase first so "on or before" is matched whole rather than as a
+# bare "before" with the "on or" part silently ignored.
+_DATE_OP_PHRASES: tuple[tuple[str, str], ...] = (
+    ("on or before", "lte"), ("on or after", "gte"),
+    ("prior to", "lt"), ("earlier than", "lt"), ("up to", "lte"), ("through", "lte"),
+    ("later than", "gt"), ("since", "gte"),
+    ("before", "lt"), ("after", "gt"),
+)
+
+
+def extract_date_range(text: str, dates: list[str]) -> dict[str, str] | None:
+    """A comparison word next to a date, turned into a `lt`/`lte`/`gt`/`gte`
+    range instead of an exact-day match.
+
+    Without this, "flights before 19 Sep" and "flights on 19 Sep" both
+    resolved to the same equality filter on 19 Sep and returned the
+    identical rows -- the qualifier was extracted nowhere and silently
+    dropped, not just under-handled.
+    """
+    if not dates:
+        return None
+    if _BETWEEN_RE.search(text) and len(dates) >= 2:
+        lo, hi = sorted(dates[:2])
+        return {"gte": lo, "lte": hi}
+    for phrase, op in _DATE_OP_PHRASES:
+        if re.search(rf"\b{re.escape(phrase)}\b", text, re.I):
+            return {op: dates[0]}
+    return None
 
 
 _HORIZON_RE = re.compile(
@@ -377,7 +413,8 @@ def extract(text: str) -> Entities:
         aircraft_types=_dedupe(ac_types),
         stations=_dedupe(stations),
         malformed_stations=_dedupe(malformed_stations),
-        dates=extract_dates(text),
+        dates=(dates := extract_dates(text)),
+        date_range=extract_date_range(text, dates),
         times=extract_times(text),
         roles=roles,
         cert_types=_dedupe(certs),

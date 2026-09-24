@@ -129,6 +129,41 @@ def test_explain_no_tools_never_crashes_on_scalar_entities():
     assert "delay minutes: 90.0" in text
 
 
+def test_date_range_words_turn_into_a_comparison_not_an_exact_match():
+    """"before"/"after"/"since"/"between" next to a date used to be dropped
+    entirely, so "flights before 19 Sep" silently matched the same equality
+    filter as "flights on 19 Sep" and returned identical rows."""
+    import entities
+
+    assert entities.extract("flights on 19 Sep").date_range is None
+    assert entities.extract("flights before 19 Sep").date_range == {"lt": "2026-09-19"}
+    assert entities.extract("flights after 16 Sep").date_range == {"gt": "2026-09-16"}
+    assert entities.extract("flights on or before 17 Sep").date_range == {"lte": "2026-09-17"}
+    assert entities.extract("flights between 15 Sep and 18 Sep").date_range == {
+        "gte": "2026-09-15", "lte": "2026-09-18",
+    }
+
+
+def test_flights_before_a_date_returns_a_different_count_than_on_it():
+    port = JsonToolPort()
+
+    def flight_count(query):
+        route = router.route(query)
+        assert route.matched_rule, query
+        trace = []
+        for c in pipeline.seed_calls(route, query):
+            trace.append(dispatch(port, c.name, c.args))
+        return len(trace[0].result)
+
+    on_count = flight_count("how many flights available on sep 19?")
+    before_count = flight_count("how many flights available before sep 19")
+    after_count = flight_count("how many flights available after sep 16")
+
+    assert on_count == 21
+    assert before_count not in (0, on_count)
+    assert after_count not in (0, on_count)
+
+
 def test_end_to_end_pipeline_produces_a_verified_answer():
     port = JsonToolPort()
     route, trace, narrative = _run(

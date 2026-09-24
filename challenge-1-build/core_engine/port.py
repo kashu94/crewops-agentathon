@@ -6,20 +6,21 @@ just the ones with a pre-written scenario answer.
 
 dCortex Crew Ops Advisor originally split this into `PostgresToolPort` (raw
 row access) and `CoreToolPort` (legality-dependent tools). Here they're
-merged into one class, because there is only one backend: the vendored
-dataset JSON files in `../data/`, loaded once and kept in memory.
+merged into one class. The name is a holdover from when this read the
+vendored dataset JSON export instead -- it now reads the same database that
+export came from, through `core_engine/db.py`, loaded once per process and
+kept in memory (see that module's docstring for why each fetch reproduces
+the JSON shapes exactly rather than returning native DB row types).
 `ResolutionAdvisorAgent` in `agents.py` is the only caller.
 """
 
 from __future__ import annotations
 
 import itertools
-import json
 import re
 from collections import Counter
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import config
@@ -28,7 +29,7 @@ from tools import (
     ToolError, crew_named, resolve_filters, row_matches, suggest_crew_names,
     with_crew_identity,
 )
-from core_engine import rules
+from core_engine import db, rules
 from core_engine.duty import MAX_DUTY_HOURS_7D, MAX_FLIGHT_HOURS_28D
 from core_engine.gates import GateWorld, iso, load_gates, next_at_gate, occupant_at, parse
 from core_engine.resolve import resolve
@@ -43,20 +44,27 @@ FUNNEL_ORDER = ("considered", "qualified", "certified", "in position",
 class JsonToolPort:
     """The vendored dataset for facts, `core_engine/` for judgement."""
 
-    # Which raw dataset file each entity comes from.
+    # Which raw dataset name (a `_FETCHERS` key, i.e. a Postgres source) each entity comes from.
     SOURCES = {
         "crew": "crew", "flights": "flights", "reserves": "reserve_pool",
         "certifications": "certifications", "risk_signals": "risk_signals",
         "costs": "costs", "pairings": "rosters",
-        # `rosters.json` nests these inside pairings. Flattening them here
-        # keeps a consistent entity shape no matter how the source file
-        # is structured.
+        # `db.fetch_rosters()` nests these inside pairings, reproducing
+        # rosters.json's old shape. Flattening them here keeps a consistent
+        # entity shape no matter how the source data is structured.
         "pairing_crew": "rosters", "pairing_days": "rosters",
     }
     ENTITIES = tuple(SOURCES)
 
-    def __init__(self, data_dir: Path | None = None) -> None:
-        self.data_dir = data_dir or config.DATA_DIR
+    # Which `core_engine.db` fetch function backs each raw dataset name.
+    _FETCHERS = {
+        "crew": db.fetch_crew, "flights": db.fetch_flights,
+        "reserve_pool": db.fetch_reserve_pool, "certifications": db.fetch_certifications,
+        "risk_signals": db.fetch_risk_signals, "costs": db.fetch_costs,
+        "rosters": db.fetch_rosters, "rules": db.fetch_rules,
+    }
+
+    def __init__(self) -> None:
         self._cache: dict[str, Any] = {}
         self._world: World | None = None
         self._gates: GateWorld | None = None
@@ -66,22 +74,21 @@ class JsonToolPort:
     @property
     def world(self) -> World:
         if self._world is None:
-            self._world = load_world(self.data_dir)
+            self._world = load_world()
         return self._world
 
     @property
     def gates(self) -> GateWorld:
         if self._gates is None:
-            rows = json.loads((self.data_dir / "boarding_gates.json").read_text(encoding="utf-8"))
-            self._gates = load_gates(rows)
+            self._gates = load_gates(db.fetch_boarding_gates())
         return self._gates
 
     def _load(self, name: str) -> Any:
         if name not in self._cache:
-            path = self.data_dir / f"{name}.json"
-            if not path.exists():
-                raise ToolError("INTERNAL", f"dataset file missing: {path.name}")
-            self._cache[name] = json.loads(path.read_text(encoding="utf-8"))
+            fetcher = self._FETCHERS.get(name)
+            if fetcher is None:
+                raise ToolError("INTERNAL", f"unknown dataset: {name}")
+            self._cache[name] = fetcher()
         return self._cache[name]
 
     def _rows(self, entity: str) -> list[dict[str, Any]]:

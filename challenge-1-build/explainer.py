@@ -514,22 +514,21 @@ Rules, in order of importance:
 """
 
 _POLISH_INSTRUCTIONS = """\
-You are writing for an airline crew controller under time pressure.
+You are writing for an airline crew controller under time pressure, in a
+chat widget that may be the only place they see this answer — a ranked-
+options card is not guaranteed to be visible anywhere else on their screen.
 
-The controller is already looking at the structured answer: the ranked
-options, the excluded pool and why each was dropped, the seven-rule verdict
-trace with its hour figures, and the tool trail. All of it is on screen.
-
-So do not restate it. Your job is the one thing a card cannot do — make the
-call. Write two or three sentences:
+Write three to six sentences:
 
 1. The recommendation, and the single reason it wins.
-2. Only if it is not already obvious: the one thing the controller should
+2. The other legal alternatives, briefly — action and cost for each, as a
+   compact list. A controller comparing options needs to see them, not just
+   be told one was picked for them.
+3. Only if it is not already obvious: the one thing the controller should
    know before accepting — a risk, a trade-off, or what to fall back to.
 
-Do NOT walk through the alternatives one by one. Do NOT recite rule ids with
-their hour figures unless that rule is itself the reason the recommendation
-is what it is. Do NOT repeat the funnel counts.
+Do NOT recite rule ids with their hour figures unless that rule is itself the
+reason the recommendation is what it is. Do NOT repeat the funnel counts.
 
 Absolute constraint: you may reword, reorder and compress. You may NOT add any
 identifier, number, name or claim that is not already present. If something is

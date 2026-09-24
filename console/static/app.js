@@ -168,8 +168,10 @@ function initChatWidget() {
       </div>
       <div class="chat-panel-subtitle">
         Answered by the same router &rarr; tools &rarr; verifier pipeline the agents use &mdash;
-        no language model in this console, so every answer is either fully sourced or says
-        plainly that it needs one.
+        most questions are settled without a language model at all; anything the router
+        can't classify falls back to the same Advisor Agent. Either way, every answer is
+        checked by the same verifier, so it's either fully sourced or says plainly that
+        it needs more.
       </div>
       <div class="chat-examples" id="chat-examples"></div>
       <div class="chat-log" id="chat-log"></div>
@@ -221,7 +223,7 @@ function appendChatMessage(role, html, cls) {
 async function askAdvisor(query) {
   document.getElementById("chat-examples").style.display = "none";
   appendChatMessage("user", escapeHtml(query));
-  const thinking = appendChatMessage("bot", `<span class="empty">Routing...</span>`);
+  const thinking = appendChatMessage("bot", `<span class="empty">Thinking...</span>`);
 
   try {
     const r = await apiPost("/api/ask", { query });
@@ -234,7 +236,16 @@ async function askAdvisor(query) {
       badge = `<span class="badge-unverified">unverified draft rejected</span>`;
     }
     thinking.classList.toggle("unverified", r.verified === false || !r.classified);
-    thinking.innerHTML = `${escapeHtml(r.narrative)}
+    // The deterministic lookup renderer (explainer.py's render_lookup) lays
+    // out real tables with space-padded columns -- only readable in a
+    // monospace font with no auto-wrap, unlike the prose an LLM-authored
+    // tier-2/3 answer returns. The box-drawing "─" separator row is that
+    // renderer's own, unique to it, so its presence reliably tells the two
+    // apart without the server needing to say which one this is.
+    const body = r.narrative.includes("─")
+      ? `<pre class="msg-table">${escapeHtml(r.narrative)}</pre>`
+      : escapeHtml(r.narrative);
+    thinking.innerHTML = `${body}
       <div class="meta">
         ${r.intent ? `<span>${escapeHtml(r.intent)} &middot; tier ${r.tier}</span>` : ""}
         ${badge}

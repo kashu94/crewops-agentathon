@@ -1,27 +1,27 @@
 """The reasoning core — candidate search, cost ranking and cascade.
 
-Loads the whole operation from the vendored JSON dataset once, then answers
-from memory. The dataset is under 700 KB, so a per-question round trip buys
-nothing. `JsonToolPort` (in `core_engine/port.py`) holds one immutable `World`
-and forks it for what-ifs.
+Loads the whole operation from Postgres once, then answers from memory —
+the dataset is small enough that a per-question round trip buys nothing.
+`JsonToolPort` (in `core_engine/port.py`) holds one immutable `World` and
+forks it for what-ifs.
 
-This is a JSON-backed port of dCortex Crew Ops Advisor's `core/engine.py`,
-which loaded the same shapes out of Postgres. The rules, the cost model and
-the candidate search are unchanged — only `load_world` differs.
+This is the same shape dCortex Crew Ops Advisor's `core/engine.py` always
+loaded out of Postgres — `core_engine/db.py` now reads that same database
+directly, rather than the vendored JSON export this module briefly read
+instead. The rules, the cost model and the candidate search are unchanged
+either way — only where `load_world` reads from differs.
 """
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from typing import Any
 
 from schemas import RuleVerdict
 from tools import ToolError
-from core_engine import rules
+from core_engine import db, rules
 from core_engine.duty import DutyDay, hours_between
 from core_engine.rules import CrewSnapshot
 
@@ -114,19 +114,22 @@ def _parse_time(value: str) -> time:
     return time(int(h), int(m))
 
 
-def _read_json(data_dir: Path, name: str) -> Any:
-    return json.loads((data_dir / f"{name}.json").read_text(encoding="utf-8"))
-
-
-def load_world(data_dir: Path) -> World:
-    """Build the in-memory `World` straight from `data/*.json`."""
-    crew_rows = _read_json(data_dir, "crew")
-    flight_rows = _read_json(data_dir, "flights")
-    roster = _read_json(data_dir, "rosters")
-    duty_clock_rows = _read_json(data_dir, "duty_clocks")
-    cert_rows = _read_json(data_dir, "certifications")
-    reserve_rows = _read_json(data_dir, "reserve_pool")
-    costs_row = _read_json(data_dir, "costs")
+def load_world() -> World:
+    """Build the in-memory `World` straight from Postgres (`core_engine/db.py`)."""
+    if not db.enabled():
+        raise ToolError(
+            "INTERNAL",
+            "LEDGER_DATABASE_URL is not set -- the core dataset now lives in "
+            "Postgres, not the vendored JSON export, so this console/agent "
+            "can't start without it.",
+        )
+    crew_rows = db.fetch_crew()
+    flight_rows = db.fetch_flights()
+    roster = db.fetch_rosters()
+    duty_clock_rows = db.fetch_duty_clocks()
+    cert_rows = db.fetch_certifications()
+    reserve_rows = db.fetch_reserve_pool()
+    costs_row = db.fetch_costs()
 
     daily_duty: dict[str, dict[date, float]] = defaultdict(dict)
     daily_flight: dict[str, dict[date, float]] = defaultdict(dict)

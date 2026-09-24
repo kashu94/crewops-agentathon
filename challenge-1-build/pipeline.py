@@ -110,7 +110,9 @@ def _flight_filters(ents: Any) -> dict[str, Any]:
         filters["dep_station"] = ents.stations[0]
     if len(ents.stations) > 1:
         filters["arr_station"] = ents.stations[1]
-    if ents.primary_date:
+    if ents.date_range:
+        filters["date"] = ents.date_range
+    elif ents.primary_date:
         filters["date"] = ents.primary_date
     if ents.flight_nos:
         filters["flight_no"] = ents.flight_nos[0]
