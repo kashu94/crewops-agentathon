@@ -220,6 +220,68 @@ function appendChatMessage(role, html, cls) {
   return div;
 }
 
+// explainer.py's deterministic render() lays out a ranked-options/consequence
+// answer as plain indented text (a "▸ recommendation" line, then labelled
+// sections like "Strategies considered:", "Alternatives:", "Against
+// cancelling:", each holding "#N ..." rows) -- readable, but visually flat
+// next to the rest of the console's card-based UI. This turns that same
+// text into the same information, structured: a highlighted recommendation
+// card, section headings, and one row per option -- without needing the
+// server to send anything other than the string it already sends.
+const _PLAN_HEADING_RE = /^([A-Za-z][A-Za-z ]+?):(?:\s+(.*))?$/;
+const _PLAN_ROW_RE = /^\s*#(\d+)\s+(.*)$/;
+
+function isPlanNarrative(text) {
+  return text.startsWith("▸ ") || text.includes("Strategies considered:");
+}
+
+function renderPlanNarrative(text) {
+  const lines = text.split("\n");
+  const out = [];
+  let i = 0;
+
+  if (lines[i] && lines[i].startsWith("▸ ")) {
+    const head = escapeHtml(lines[i].slice(2).trim());
+    i++;
+    const subLines = [];
+    while (lines[i] && lines[i].trim() && /^\s/.test(lines[i]) && !_PLAN_ROW_RE.test(lines[i])) {
+      subLines.push(escapeHtml(lines[i].trim()));
+      i++;
+    }
+    out.push(`<div class="plan-recommend">
+      <div class="plan-recommend-badge">Recommended</div>
+      <div class="plan-recommend-head">${head}</div>
+      ${subLines.map((s) => `<div class="plan-recommend-sub">${s}</div>`).join("")}
+    </div>`);
+  }
+
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    const rowMatch = _PLAN_ROW_RE.exec(line);
+    if (rowMatch) {
+      out.push(`<div class="plan-row"><span class="plan-row-rank">#${rowMatch[1]}</span>` +
+        `<span class="plan-row-text">${escapeHtml(rowMatch[2])}</span></div>`);
+      continue;
+    }
+
+    if (!/^\s/.test(line)) {
+      const headingMatch = _PLAN_HEADING_RE.exec(line.trim());
+      if (headingMatch) {
+        out.push(`<div class="plan-heading">${escapeHtml(headingMatch[1])}` +
+          (headingMatch[2] ? `<span class="plan-heading-value">${escapeHtml(headingMatch[2])}</span>` : "") +
+          `</div>`);
+        continue;
+      }
+    }
+
+    out.push(`<div class="plan-line">${escapeHtml(line.trim())}</div>`);
+  }
+
+  return `<div class="msg-plan">${out.join("")}</div>`;
+}
+
 async function askAdvisor(query) {
   document.getElementById("chat-examples").style.display = "none";
   appendChatMessage("user", escapeHtml(query));
@@ -244,6 +306,8 @@ async function askAdvisor(query) {
     // apart without the server needing to say which one this is.
     const body = r.narrative.includes("─")
       ? `<pre class="msg-table">${escapeHtml(r.narrative)}</pre>`
+      : isPlanNarrative(r.narrative)
+      ? renderPlanNarrative(r.narrative)
       : escapeHtml(r.narrative);
     thinking.innerHTML = `${body}
       <div class="meta">

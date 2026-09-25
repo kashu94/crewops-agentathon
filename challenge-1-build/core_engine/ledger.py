@@ -162,7 +162,7 @@ def recent_decisions(limit: int = 50) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT request_id, decided_at_utc, decision_type, accepted_rank,
-                          custom_crew_id
+                          custom_crew_id, committed_by
                    FROM controller_decisions
                    ORDER BY decided_at_utc DESC LIMIT %s""",
                 (limit,),
@@ -170,7 +170,7 @@ def recent_decisions(limit: int = 50) -> list[dict[str, Any]]:
             rows = cur.fetchall()
     return [
         {"disruption_id": r[0], "decided_at_utc": r[1].isoformat(), "decision_type": r[2],
-         "accepted_rank": r[3], "custom_crew_id": r[4]}
+         "accepted_rank": r[3], "custom_crew_id": r[4], "committed_by": r[5]}
         for r in rows
     ]
 

@@ -143,6 +143,34 @@ content, prompt injection — a portal config, see
 filter doesn't know what a sourced number is; the verifier doesn't know what
 a slur is. Neither is a substitute for the other two.
 
+## Operational Metrics
+
+**Latency.** Deterministic-path answers respond in well under a second, since
+they're pure database lookups with no model call involved. Agentic-path
+answers — the ones that go through Triage, the tool-calling loop, and the
+Explainer — run roughly 3 to 10 seconds, based on two real traces: a
+single-turn call logged 3.7 seconds, and a two-hop trace logged about 8.6
+seconds total.
+
+**Cost per tier.** Token usage runs roughly 2,000 to 6,500 tokens per answer,
+with Tier 3 questions costing noticeably more than Tier 1 due to extra tool
+round-trips.
+
+**Verifier rejection rate.** On the canonical 38-question set, the rejection
+rate is effectively zero in the most recent run — every draft was accepted
+without falling back. Under harder, adversarial phrasing, development testing
+found issues in roughly 13 percent of cases (43 out of 323), the closest real
+proxy available, though it blends automatic Verifier catches with
+manually-found issues rather than being one clean metric.
+
+**Fallback frequency.** The Explainer's silent fallback-to-template path was
+observed triggering in about 1 of 12 sampled runs — a small enough sample to
+treat as a signal rather than a solid rate.
+
+**False-acceptance rate.** Not yet measured. It requires comparing every
+verified answer's actual content against its expected output across all 38
+questions — the next concrete step for evaluation rigor.
+
 ## Where this came from
 
 This lab ports the pipeline design, the legality rules, the cost model, the
